@@ -27,9 +27,12 @@ The app can run in local SQLite mode or in cloud mode. Cloud mode uses the Supab
 To migrate the supplied local data and bring the API online:
 
 1. In the Supabase dashboard, open **SQL Editor** and run `supabase/migrations/20261120133000_initial_schema.sql`. The migration creates the app's tables, case-insensitive indexes, and row-level-security protections. Run it once in the new, empty project.
-2. Before deploying the API, import the existing local database. From this project folder, run `npm ci`. In PowerShell, use the following to enter the connection string without echoing it, run the one-time import, and remove it from the shell environment:
+2. Before deploying the API, import the existing local database. Open PowerShell and first change to the project folder. Paste the entire block below; when prompted, paste the complete PostgreSQL **Session pooler URI** and press Enter:
 
    ```powershell
+   Set-Location -LiteralPath 'C:\Users\Windows User\Desktop\Grok\CApitol STock Management'
+   if (-not (Test-Path -LiteralPath '.\package.json')) { throw 'Open PowerShell in the project folder before importing.' }
+   npm.cmd ci
    $secret = Read-Host 'Supabase session-pooler DATABASE_URL (input is hidden)' -AsSecureString
    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
    try {
@@ -42,7 +45,9 @@ To migrate the supplied local data and bring the API online:
    }
    ```
 
-   Close the desktop app before importing. The importer reads `data/capitol-stock.sqlite` (including its SQLite WAL/SHM files) from this project folder. Copy the **session pooler** URI from Supabase **Connect → Session pooler**. The importer refuses to write if any target data table is non-empty, checks source SQLite integrity and foreign keys, imports in one transaction, verifies every source row against PostgreSQL, and prints table counts only. Keep the SQLite database and its WAL/SHM files as the backup.
+   In Supabase, open **Connect → Connection string → Session pooler** and copy the URI. It must start with `postgresql://` (or `postgres://`) and contain your database password; the `https://<project-ref>.supabase.co` project URL is not the database URI. Replace any `[YOUR-DATABASE-PASSWORD]` placeholder before copying. Do not paste the URI after the PowerShell block has finished, and never share it in chat. If you have lost the database password, reset it in Supabase first; this may invalidate other clients using the old password.
+
+   Close the desktop app before importing. The importer reads `data/capitol-stock.sqlite` (including its SQLite WAL/SHM files) from this project folder. It refuses to write if any target data table is non-empty, checks source SQLite integrity and foreign keys, imports in one transaction, verifies every source row against PostgreSQL, and prints table counts only. Keep the SQLite database and its WAL/SHM files as the backup.
 3. Only after the import reports all tables verified, sign in to Render with GitHub, choose **New → Blueprint**, and select `popoone1/Capitol-Stock-Management`. When prompted, paste the same URI into the secret `DATABASE_URL` field. Render deploys the `capitol-stock-management` service from `render.yaml`; the free instance may sleep and take a short time to wake.
 
 4. After Render reports the service is live, open `https://<your-service>.onrender.com/api/health`. Confirm it returns `{"ok":true,"database":"postgres","sqlite":false}`, then visit the service root and confirm the sign-in page loads. Imported accounts are marked to require a password change. On each user's first cloud sign-in, they enter their existing PIN once, then immediately set a unique password of at least 12 characters with uppercase and lowercase letters and a number. The PIN is never accepted for a completed cloud sign-in. Failed attempts are limited and persisted in PostgreSQL. Do not share the hosted URL until the administrator has completed this reset.
