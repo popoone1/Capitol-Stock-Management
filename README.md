@@ -27,12 +27,29 @@ The app can run in local SQLite mode or in cloud mode. Cloud mode uses the Supab
 To migrate the supplied local data and bring the API online:
 
 1. In the Supabase dashboard, open **SQL Editor** and run `supabase/migrations/20261120133000_initial_schema.sql`. The migration creates the app's tables, case-insensitive indexes, and row-level-security protections. Run it once in the new, empty project.
-2. In Render, create a Blueprint from this private GitHub repository and set `DATABASE_URL` to Supabase's **session pooler** connection string (including its SSL setting). Keep it as a Render secret; never put the password in Git, an installer, or chat. The schema must be created before the API service starts.
-3. Imported accounts are marked to require a password change. On each user's first cloud sign-in, they enter their existing PIN once, then immediately set a unique password of at least 12 characters with uppercase and lowercase letters and a number. The PIN is never accepted for a completed cloud sign-in. Failed attempts are limited and persisted in PostgreSQL. Do not share the hosted URL until the administrator has completed this reset.
-4. From this project folder, run `npm ci`, then run `scripts/import-sqlite-to-postgres.js` with `DATABASE_URL` set in the terminal environment. The importer refuses to write if any target table already contains rows, checks the source SQLite integrity and foreign keys, imports in one transaction, verifies every row, and prints only table counts and verification status. Keep the SQLite database and its WAL/SHM files as the backup.
-5. After the import succeeds, set the Render `DATABASE_URL` secret and deploy. Health checks verify a live database connection. The app is then available at the Render service URL. To package a desktop client that opens the hosted app, set `remoteAppUrl` in `assets/cloud-config.json` to that HTTPS URL and build the Windows installer; leave this value blank for local SQLite development.
+2. Before deploying the API, import the existing local database. From this project folder, run `npm ci`. In PowerShell, use the following to enter the connection string without echoing it, run the one-time import, and remove it from the shell environment:
 
-The source migration and importer do not upload the SQLite snapshot automatically. Do not deploy the public API until the schema is installed, data import is verified, and account credentials are secured.
+   ```powershell
+   $secret = Read-Host 'Supabase session-pooler DATABASE_URL (input is hidden)' -AsSecureString
+   $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret)
+   try {
+     $env:DATABASE_URL = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+     npm.cmd run import:cloud
+   } finally {
+     Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
+     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+     $secret.Dispose()
+   }
+   ```
+
+   Copy the **session pooler** URI from Supabase **Connect → Session pooler**. The importer refuses to write if any target data table is non-empty, checks source SQLite integrity and foreign keys, imports in one transaction, verifies every source row against PostgreSQL, and prints table counts only. Keep the SQLite database and its WAL/SHM files as the backup.
+3. Only after the import reports all tables verified, sign in to Render with GitHub, choose **New → Blueprint**, and select `popoone1/Capitol-Stock-Management`. When prompted, paste the same URI into the secret `DATABASE_URL` field. Render deploys the `capitol-stock-management` service from `render.yaml`; the free instance may sleep and take a short time to wake.
+
+4. After Render reports the service is live, open its `onrender.com` URL and confirm the sign-in page loads. Imported accounts are marked to require a password change. On each user's first cloud sign-in, they enter their existing PIN once, then immediately set a unique password of at least 12 characters with uppercase and lowercase letters and a number. The PIN is never accepted for a completed cloud sign-in. Failed attempts are limited and persisted in PostgreSQL. Do not share the hosted URL until the administrator has completed this reset.
+
+5. Update `assets/cloud-config.json` with Render's exact HTTPS URL, commit and push that one-file change, then run `npm.cmd run package:win` to create the desktop installer configured for the hosted app. Install and test the new installer before distributing it.
+
+The source migration and importer do not upload the SQLite snapshot automatically. The importer cannot be rerun after success unless the target data tables are emptied first; keep the verified SQLite snapshot as the backup. Never put the connection URI or its password in Git, an installer, or chat.
 
 Standard users can create department requisitions and water requests. Auditors can review inventory, stock movements (including voids and reversals), water history, and the audit log, but cannot change records. Admins can manage users, requesters, categories, stores, catalog items, water records, historical stock movements, shared appearance settings, and email settings. Stock movement corrections reconcile linked batches; voids keep the original entry and add a same-date compensating movement to preserve the historical audit trail. Stores are disabled rather than hard-deleted when they have history.
 
