@@ -6,7 +6,7 @@
   "main": "electron-main.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check app.js && node --check electron-main.js && node --check scripts/download-node.js && node --check scripts/create-windows-icon.js",
+    "check": "node --check server.js && node --check postgres-adapter.js && node --check postgres-worker.js && node --check app.js && node --check electron-main.js && node --check scripts/download-node.js && node --check scripts/create-windows-icon.js && node --check scripts/import-sqlite-to-postgres.js && node scripts/test-postgres-adapter.js",
     "package:win": "npm run check && node scripts/create-windows-icon.js && node scripts/download-node.js && electron-builder --win nsis"
   },
   "engines": {
@@ -14,7 +14,8 @@
   },
   "dependencies": {
     "bootstrap": "^5.3.8",
-    "nodemailer": "^10.3.0"
+    "nodemailer": "^10.3.0",
+    "pg": "^8.16.3"
   },
   "devDependencies": {
     "electron": "^45.2.1",
@@ -30,6 +31,8 @@
     "files": [
       "electron-main.js",
       "server.js",
+      "postgres-adapter.js",
+      "postgres-worker.js",
       "app.js",
       "styles.css",
       "index.html",

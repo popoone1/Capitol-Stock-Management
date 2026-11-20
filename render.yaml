@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: capitol-stock-management
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm ci
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false

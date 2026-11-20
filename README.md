@@ -20,6 +20,20 @@ For development only, `npm start` starts the local web server and `start.bat` op
 
 On first use, create the administrator in the setup screen. There is no default password. New accounts and password resets require a four-digit numeric PIN. Existing accounts keep their current password and may continue using it until an administrator resets it. Admins can create, edit, disable, reset, and delete accounts, and assign standard user, administrator, or read-only auditor access.
 
+## Supabase cloud deployment
+
+The app can run in local SQLite mode or in cloud mode. Cloud mode uses the Supabase PostgreSQL database through the Node API in this repository; the desktop client never receives a database password or a Supabase service-role key. Render is configured as the free pilot API host in `render.yaml`. Its free web service can sleep while idle, so the first request after inactivity may take a little time to wake up.
+
+To migrate the supplied local data and bring the API online:
+
+1. In the Supabase dashboard, open **SQL Editor** and run `supabase/migrations/20261120133000_initial_schema.sql`. The migration creates the app's tables, case-insensitive indexes, and row-level-security protections. Run it once in the new, empty project.
+2. In Render, create a Blueprint from this private GitHub repository and set `DATABASE_URL` to Supabase's **session pooler** connection string (including its SSL setting). Keep it as a Render secret; never put the password in Git, an installer, or chat. The schema must be created before the API service starts.
+3. Imported accounts are marked to require a password change. On each user's first cloud sign-in, they enter their existing PIN once, then immediately set a unique password of at least 12 characters with uppercase and lowercase letters and a number. The PIN is never accepted for a completed cloud sign-in. Failed attempts are limited and persisted in PostgreSQL. Do not share the hosted URL until the administrator has completed this reset.
+4. From this project folder, run `npm ci`, then run `scripts/import-sqlite-to-postgres.js` with `DATABASE_URL` set in the terminal environment. The importer refuses to write if any target table already contains rows, checks the source SQLite integrity and foreign keys, imports in one transaction, verifies every row, and prints only table counts and verification status. Keep the SQLite database and its WAL/SHM files as the backup.
+5. After the import succeeds, set the Render `DATABASE_URL` secret and deploy. Health checks verify a live database connection. The app is then available at the Render service URL. To package a desktop client that opens the hosted app, set `remoteAppUrl` in `assets/cloud-config.json` to that HTTPS URL and build the Windows installer; leave this value blank for local SQLite development.
+
+The source migration and importer do not upload the SQLite snapshot automatically. Do not deploy the public API until the schema is installed, data import is verified, and account credentials are secured.
+
 Standard users can create department requisitions and water requests. Auditors can review inventory, stock movements (including voids and reversals), water history, and the audit log, but cannot change records. Admins can manage users, requesters, categories, stores, catalog items, water records, historical stock movements, shared appearance settings, and email settings. Stock movement corrections reconcile linked batches; voids keep the original entry and add a same-date compensating movement to preserve the historical audit trail. Stores are disabled rather than hard-deleted when they have history.
 
 Use the theme button in the top bar to switch between light and dark themes. The preference is saved in this browser on this PC. Administrators can choose a shared glass or classic surface, Inter or Manrope typography, accent color and standard or large text under **Admin → Appearance**. Bootstrap styles and scripts and the licensed font files are bundled locally, so the interface does not need a network connection.
@@ -57,8 +71,8 @@ Gmail delivery needs an internet connection and a valid App Password. If mailing
 
 Administrators can use **Admin → Clear All** to reset inventory and other system records while retaining user accounts. The five default stores, default categories and standard requester lists are recreated, custom inventory columns and values are removed, custom Gmail settings are cleared, and the reset is recorded in the audit log. The action requires explicit typed confirmation.
 
-## Local database and privacy
+## Database and privacy
 
-The SQLite database is `data/capitol-stock.sqlite`. It holds stock/catalog, batches, movements, requisitions, users, water logs, settings and the admin audit trail. The server binds to `127.0.0.1` only. Passwords are stored as salted scrypt hashes; active sessions are in memory and end when the server stops. Keep regular backups of the `data` folder. This is a single-computer application; it does not provide multi-PC synchronization.
+In local mode the SQLite database is `data/capitol-stock.sqlite`; the server binds to `127.0.0.1` only. In hosted mode the server uses `DATABASE_URL` and binds to the host-provided interface. Passwords are stored as salted scrypt hashes; active sessions are held in server memory and end on restart. The app uses same-origin HTTP-only cookies, CSRF checks, and requires HTTPS for cloud desktop URLs. Back up the local database before migration and the Supabase project regularly after going online.
 
 The supplied Apps Script endpoint redirected to Google sign-in in the available browser. The implementation uses the source code and requirements provided in the request; it does not connect to that Google Sheet.

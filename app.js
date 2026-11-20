@@ -117,13 +117,13 @@ async function api(url, options = {}) {
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
     });
   } catch (error) {
-    throw new Error(`The local app server is unavailable. Restart start.bat and try again. ${error.message}`);
+    throw new Error(`The app server is unavailable. Check your internet connection and try again. ${error.message}`);
   }
   let result;
   try {
     result = await response.json();
   } catch (error) {
-    throw new Error(`The local server returned an invalid response (${response.status}). ${error.message}`);
+    throw new Error(`The app server returned an invalid response (${response.status}). ${error.message}`);
   }
   if (!response.ok) {
     const failure = new Error(result.error || `Request failed (${response.status}).`);
@@ -158,6 +158,34 @@ function field(label, id, type = "text", options = {}) {
     return `<label class="form-field"><span>${label}</span><select id="${id}" name="${esc(options.name || id)}" ${options.required ? "required" : ""}>${choices}</select></label>`;
   }
   return `<label class="form-field"><span>${label}</span><input id="${id}" name="${esc(options.name || id)}" type="${type}" ${attrs}/></label>`;
+}
+
+function passwordField(label, id, autocomplete = "new-password") {
+  if (state.bootstrap?.passwordPolicy === "strong") {
+    return field(label, id, "password", {
+      required: true,
+      minlength: 12,
+      maxlength: 128,
+      pattern: "(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9]).{12,128}",
+      autocomplete,
+      placeholder: "12+ characters, upper/lowercase and a number",
+    });
+  }
+  return field(label, id, "password", {
+    required: true,
+    minlength: 4,
+    maxlength: 4,
+    pattern: "[0-9]{4}",
+    inputmode: "numeric",
+    autocomplete,
+    placeholder: "Four numbers",
+  });
+}
+
+function passwordPolicyDescription() {
+  return state.bootstrap?.passwordPolicy === "strong"
+    ? "Use at least 12 characters with uppercase and lowercase letters and a number."
+    : "Use exactly four numbers. Passwords are stored as salted, one-way hashes locally.";
 }
 
 function button(text, action, options = {}) {
@@ -621,9 +649,9 @@ function renderAdmin(data = state.admin) {
   const tabs = ["Users", "Requesters", "Departments", "Housekeeping Areas", "Categories", "Locations", "Inventory columns", "Appearance", "Email", "Audit log", "Clear All"].map(section => `<button class="${state.adminSection === section ? "active" : ""}" data-admin-section="${section}">${section}</button>`).join("");
   let content = "";
   if (state.adminSection === "Users") {
-    const users = data.users.map(user => `<tr><td><input class="inline-edit" data-user-name="${user.id}" value="${esc(user.displayName)}" aria-label="Display name for ${esc(user.username)}"><small class="cell-sub">@${esc(user.username)}</small></td><td><select class="user-role" data-user-role="${user.id}" ${user.id === state.bootstrap.user.id ? "disabled" : ""}><option value="user" ${user.role === "user" ? "selected" : ""}>Standard user</option><option value="auditor" ${user.role === "auditor" ? "selected" : ""}>Auditor</option><option value="admin" ${user.role === "admin" ? "selected" : ""}>Administrator</option></select></td><td><select class="user-active" data-user-active="${user.id}" ${user.id === state.bootstrap.user.id ? "disabled" : ""}><option value="true" ${user.active ? "selected" : ""}>Enabled</option><option value="false" ${!user.active ? "selected" : ""}>Disabled</option></select></td><td>${prettyDate(user.createdAt)}</td><td><div class="admin-row-actions"><button class="button small secondary" data-action="save-user" data-id="${user.id}">Save</button><button class="link-button" data-action="reset-user-password" data-id="${user.id}">Reset PIN</button>${user.id !== state.bootstrap.user.id ? `<button class="button small danger" data-action="delete-user" data-id="${user.id}">Delete</button>` : ""}</div></td></tr>`).join("");
+    const users = data.users.map(user => `<tr><td><input class="inline-edit" data-user-name="${user.id}" value="${esc(user.displayName)}" aria-label="Display name for ${esc(user.username)}"><small class="cell-sub">@${esc(user.username)}</small></td><td><select class="user-role" data-user-role="${user.id}" ${user.id === state.bootstrap.user.id ? "disabled" : ""}><option value="user" ${user.role === "user" ? "selected" : ""}>Standard user</option><option value="auditor" ${user.role === "auditor" ? "selected" : ""}>Auditor</option><option value="admin" ${user.role === "admin" ? "selected" : ""}>Administrator</option></select></td><td><select class="user-active" data-user-active="${user.id}" ${user.id === state.bootstrap.user.id ? "disabled" : ""}><option value="true" ${user.active ? "selected" : ""}>Enabled</option><option value="false" ${!user.active ? "selected" : ""}>Disabled</option></select>${user.passwordResetRequired ? `<small class="cell-sub">Password change required</small>` : ""}</td><td>${prettyDate(user.createdAt)}</td><td><div class="admin-row-actions"><button class="button small secondary" data-action="save-user" data-id="${user.id}">Save</button><button class="link-button" data-action="reset-user-password" data-id="${user.id}">${state.bootstrap.passwordPolicy === "strong" ? "Reset password" : "Reset PIN"}</button>${user.id !== state.bootstrap.user.id ? `<button class="button small danger" data-action="delete-user" data-id="${user.id}">Delete</button>` : ""}</div></td></tr>`).join("");
     content = `<div class="admin-grid"><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">ACCESS CONTROL</span><h2>Team accounts</h2><p>Admins manage stock, standard users enter requests, auditors have read-only access.</p></div><span class="count-chip">${data.users.length} accounts</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>USER</th><th>ROLE</th><th>STATUS</th><th>CREATED</th><th>ACTIONS</th></tr></thead><tbody>${users}</tbody></table></div></section>
-    <section class="card admin-card"><div class="panel-heading"><div><span class="section-label">INVITE STAFF</span><h2>Create an account</h2><p>New passwords must be four digits.</p></div></div><form id="user-form" class="stack-form">${field("USERNAME *", "username", "text", { required: true, minlength: 3, maxlength: 40, placeholder: "e.g. store.user" })}${field("DISPLAY NAME *", "displayName", "text", { required: true, minlength: 2, maxlength: 80 })}${field("ROLE *", "role", "text", { required: true, select: [{ value: "user", label: "Standard user" }, { value: "auditor", label: "Auditor (read-only)" }, { value: "admin", label: "Administrator" }] })}${field("4-DIGIT PASSWORD *", "password", "password", { required: true, minlength: 4, maxlength: 4, pattern: "[0-9]{4}", inputmode: "numeric", autocomplete: "new-password" })}<button class="button primary" type="submit">Create account</button></form></section></div>`;
+    <section class="card admin-card"><div class="panel-heading"><div><span class="section-label">INVITE STAFF</span><h2>Create an account</h2><p>${esc(passwordPolicyDescription())}</p></div></div><form id="user-form" class="stack-form">${field("USERNAME *", "username", "text", { required: true, minlength: 3, maxlength: 40, placeholder: "e.g. store.user" })}${field("DISPLAY NAME *", "displayName", "text", { required: true, minlength: 2, maxlength: 80 })}${field("ROLE *", "role", "text", { required: true, select: [{ value: "user", label: "Standard user" }, { value: "auditor", label: "Auditor (read-only)" }, { value: "admin", label: "Administrator" }] })}${passwordField(state.bootstrap.passwordPolicy === "strong" ? "PASSWORD *" : "4-DIGIT PASSWORD *", "password")}<button class="button primary" type="submit">Create account</button></form></section></div>`;
   } else if (state.adminSection === "Requesters") {
     const rows = data.requesters.map(person => `<tr><td>${person.scope === "water" ? "Water" : "Stock"}</td><td>${esc(person.department || "—")}</td><td><input class="inline-edit" data-requester-name="${person.id}" value="${esc(person.name)}" aria-label="Requester name"></td><td><select class="user-active" data-requester-active="${person.id}"><option value="true" ${person.active ? "selected" : ""}>Enabled</option><option value="false" ${!person.active ? "selected" : ""}>Disabled</option></select></td><td><div class="admin-row-actions"><button class="button small secondary" data-action="save-requester" data-id="${person.id}">Save</button><button class="button small danger" data-action="delete-requester" data-id="${person.id}">Delete</button></div></td></tr>`).join("");
     content = `<div class="admin-grid"><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">REQUESTER LISTS</span><h2>Stock and water requesters</h2><p>Names can be disabled or removed; existing records keep their saved names.</p></div></div><div class="table-scroll"><table class="data-table"><thead><tr><th>TYPE</th><th>DEPARTMENT</th><th>NAME</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>${rows}</tbody></table></div></section><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">ADD REQUESTER</span><h2>New requester</h2></div></div><form id="requester-form" class="stack-form">${field("REQUEST TYPE *", "scope", "text", { required: true, select: [{ value: "water", label: "Water" }, { value: "stock", label: "Stock requisition" }] })}${field("DEPARTMENT", "department", "text", { select: [{ value: "", label: "Not applicable" }, ...state.bootstrap.departments.map(value => ({ value, label: value }))] })}${field("NAME *", "name", "text", { required: true, minlength: 2, maxlength: 80 })}<button class="button primary" type="submit">Add requester</button></form></section></div>`;
@@ -720,11 +748,12 @@ async function navigate(page) {
 }
 
 function showSetup() {
-  app.innerHTML = `<div class="auth-screen"><section class="auth-card"><div class="auth-brand"><span class="brand-mark"><img src="/assets/capitol-catering-icon.png" alt="Capitol Catering"></span><div><strong>CAPITOL</strong><small>STOCK MANAGEMENT</small></div></div><span class="eyebrow">ONE-TIME LOCAL SETUP</span><h1>Create your administrator</h1><p>This account controls stock, users, locations and water-record cleanup. Choose a unique password; there is no default login.</p><form id="setup-form">${field("ADMIN USERNAME *", "username", "text", { required: true, minlength: 3, maxlength: 40, autocomplete: "username", placeholder: "e.g. capitol.admin" })}${field("DISPLAY NAME *", "displayName", "text", { required: true, minlength: 2, maxlength: 80, autocomplete: "name", placeholder: "Your name" })}${field("4-DIGIT PASSWORD *", "password", "password", { required: true, minlength: 4, maxlength: 4, pattern: "[0-9]{4}", inputmode: "numeric", autocomplete: "new-password", placeholder: "Four numbers" })}${field("CONFIRM PASSWORD *", "confirmPassword", "password", { required: true, minlength: 4, maxlength: 4, pattern: "[0-9]{4}", inputmode: "numeric", autocomplete: "new-password" })}<p class="auth-security">Use exactly four numbers. Passwords are stored as salted, one-way hashes locally.</p><button class="button primary auth-submit" type="submit">Create administrator →</button></form><small class="local-auth-note"><i></i> Only available before any user account exists.</small></section></div>`;
+  app.innerHTML = `<div class="auth-screen"><section class="auth-card"><div class="auth-brand"><span class="brand-mark"><img src="/assets/capitol-catering-icon.png" alt="Capitol Catering"></span><div><strong>CAPITOL</strong><small>STOCK MANAGEMENT</small></div></div><span class="eyebrow">ONE-TIME SETUP</span><h1>Create your administrator</h1><p>This account controls stock, users, locations and water-record cleanup. Choose a unique password; there is no default login.</p><form id="setup-form">${field("ADMIN USERNAME *", "username", "text", { required: true, minlength: 3, maxlength: 40, autocomplete: "username", placeholder: "e.g. capitol.admin" })}${field("DISPLAY NAME *", "displayName", "text", { required: true, minlength: 2, maxlength: 80, autocomplete: "name", placeholder: "Your name" })}${passwordField(state.bootstrap.passwordPolicy === "strong" ? "PASSWORD *" : "4-DIGIT PASSWORD *", "password")}${passwordField("CONFIRM PASSWORD *", "confirmPassword") }<p class="auth-security">${esc(passwordPolicyDescription())}</p><button class="button primary auth-submit" type="submit">Create administrator →</button></form><small class="local-auth-note"><i></i> Only available before any user account exists.</small></section></div>`;
 }
 
 function showLogin() {
-  app.innerHTML = `<div class="auth-screen"><section class="auth-card"><div class="auth-brand"><span class="brand-mark"><img src="/assets/capitol-catering-icon.png" alt="Capitol Catering"></span><div><strong>CAPITOL</strong><small>STOCK MANAGEMENT</small></div></div><span class="eyebrow">LOCAL SIGN IN</span><h1>Welcome back</h1><p>Sign in to your local Capitol stock workspace.</p><form id="login-form">${field("USERNAME", "username", "text", { required: true, autocomplete: "username" })}${field("PASSWORD", "password", "password", { required: true, maxlength: 256, autocomplete: "current-password" })}<button class="button primary auth-submit" type="submit">Sign in →</button></form><small class="local-auth-note"><i></i> Existing passwords continue to work until reset. New and reset passwords use four digits.</small></section></div>`;
+  const cloudMode = state.bootstrap?.passwordPolicy === "strong";
+  app.innerHTML = `<div class="auth-screen"><section class="auth-card"><div class="auth-brand"><span class="brand-mark"><img src="/assets/capitol-catering-icon.png" alt="Capitol Catering"></span><div><strong>CAPITOL</strong><small>STOCK MANAGEMENT</small></div></div><span class="eyebrow">${cloudMode ? "SECURE CLOUD SIGN IN" : "LOCAL SIGN IN"}</span><h1>Welcome back</h1><p>${cloudMode ? "Sign in with your account. Imported PINs must be replaced with a strong password before access." : "Sign in to your local Capitol stock workspace."}</p><form id="login-form">${field("USERNAME", "username", "text", { required: true, autocomplete: "username" })}${field(cloudMode ? "CURRENT PASSWORD OR IMPORTED PIN" : "PASSWORD", "password", "password", { required: true, maxlength: 256, autocomplete: "current-password" })}<div id="new-cloud-password-slot"></div><button class="button primary auth-submit" type="submit">Sign in →</button></form><small class="local-auth-note"><i></i> ${cloudMode ? "Cloud passwords require at least 12 characters with uppercase and lowercase letters and a number." : "Existing passwords continue to work until reset. New and reset passwords use four digits."}</small></section></div>`;
 }
 
 async function initialize() {
@@ -1216,7 +1245,8 @@ function closeModal() {
 }
 
 function passwordModal(userId) {
-  return `<div class="modal-backdrop" data-action="close-modal"><section class="modal small-modal" role="dialog" aria-modal="true"><div class="modal-heading"><div><span class="section-label">ADMIN RESET</span><h2>Set a new PIN</h2><p>Choose exactly four numbers. Existing longer passwords remain valid until reset.</p></div><button type="button" class="modal-close" data-action="close-modal">×</button></div><form id="password-reset-form" data-user-id="${esc(userId)}">${field("4-DIGIT PASSWORD *", "password", "password", { required: true, minlength: 4, maxlength: 4, pattern: "[0-9]{4}", inputmode: "numeric", autocomplete: "new-password" })}<div class="modal-actions"><button class="button secondary" type="button" data-action="close-modal">Cancel</button><button class="button primary" type="submit">Reset PIN</button></div></form></section></div>`;
+  const strong = state.bootstrap.passwordPolicy === "strong";
+  return `<div class="modal-backdrop" data-action="close-modal"><section class="modal small-modal" role="dialog" aria-modal="true"><div class="modal-heading"><div><span class="section-label">ADMIN RESET</span><h2>Set a new ${strong ? "password" : "PIN"}</h2><p>${esc(passwordPolicyDescription())}</p></div><button type="button" class="modal-close" data-action="close-modal">×</button></div><form id="password-reset-form" data-user-id="${esc(userId)}">${passwordField(strong ? "NEW PASSWORD *" : "4-DIGIT PASSWORD *", "password")}<div class="modal-actions"><button class="button secondary" type="button" data-action="close-modal">Cancel</button><button class="button primary" type="submit">Reset ${strong ? "password" : "PIN"}</button></div></form></section></div>`;
 }
 
 function updateWaterCount() {
@@ -1418,6 +1448,13 @@ document.addEventListener("submit", async event => {
     setLoading(submit, true, "Signing in…");
     try {
       const result = await api("/api/login", { method: "POST", body: formValues(form) });
+      if (result.passwordResetRequired) {
+        form.querySelector("#new-cloud-password-slot").innerHTML = passwordField("NEW STRONG PASSWORD *", "newPassword");
+        submit.dataset.originalText = "Update password and sign in →";
+        form.querySelector("#newPassword")?.focus();
+        toast("Your imported PIN is verified. Set a strong cloud password to continue.");
+        return;
+      }
       state.bootstrap.user = result.user;
       state.bootstrap.csrfToken = result.csrfToken;
       await navigate("Dashboard");
@@ -1521,7 +1558,7 @@ document.addEventListener("submit", async event => {
     finally { if (submit.isConnected) setLoading(submit, false); }
   } else if (form.id === "password-reset-form") {
     const submit = form.querySelector('[type="submit"]');
-    setLoading(submit, true, "Resetting PIN…");
+    setLoading(submit, true, state.bootstrap.passwordPolicy === "strong" ? "Resetting password…" : "Resetting PIN…");
     try {
       await api(`/api/admin/users/${encodeURIComponent(form.dataset.userId)}/password`, { method: "PUT", body: formValues(form) });
       closeModal();

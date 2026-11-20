@@ -11,6 +11,8 @@ const NODE_RUNTIME = path.join(process.resourcesPath, "node-runtime", "node.exe"
 const APP_DATA = path.join(app.getPath("appData"), PRODUCT_NAME);
 const DATA_DIR = path.join(APP_DATA, "data");
 const LOG_DIR = path.join(APP_DATA, "logs");
+const cloudConfig = require(path.join(app.getAppPath(), "assets", "cloud-config.json"));
+const REMOTE_APP_URL = process.env.CAPITOL_REMOTE_URL || cloudConfig.remoteAppUrl || "";
 
 app.setPath("userData", APP_DATA);
 app.setAppUserModelId("com.capitol.stockmanagement");
@@ -90,7 +92,7 @@ async function startServer() {
   throw new Error(`The local server could not start after several attempts. Review ${logPath} for details.`);
 }
 
-function createWindow(port) {
+function createWindow(url) {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -109,7 +111,7 @@ function createWindow(port) {
   });
   mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  mainWindow.loadURL(`http://127.0.0.1:${port}`).catch(error => {
+  mainWindow.loadURL(url).catch(error => {
     dialog.showErrorBox(PRODUCT_NAME, `The application window could not be opened.\n\n${error.message}`);
     app.quit();
   });
@@ -125,8 +127,14 @@ app.on("second-instance", () => {
 
 app.whenReady().then(async () => {
   try {
+    if (REMOTE_APP_URL) {
+      const remoteUrl = new URL(REMOTE_APP_URL);
+      if (remoteUrl.protocol !== "https:") throw new Error("The cloud application URL must use HTTPS.");
+      createWindow(remoteUrl.href);
+      return;
+    }
     const port = await startServer();
-    createWindow(port);
+    createWindow(`http://127.0.0.1:${port}`);
   } catch (error) {
     dialog.showErrorBox(PRODUCT_NAME, `Capitol Stock Management could not start.\n\n${error.message}`);
     app.quit();
