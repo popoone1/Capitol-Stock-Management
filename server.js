@@ -3,12 +3,17 @@ const http = require("node:http");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
+const { PostgresDatabase } = require("./postgres-adapter");
 
 const ROOT = __dirname;
 const DATA_DIR = process.env.CAPITOL_DATA_DIR || path.join(ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "capitol-stock.sqlite");
 const PORT = Number(process.env.PORT || 8766);
-const HOST = "127.0.0.1";
+const usePostgres = Boolean(process.env.DATABASE_URL);
+if (process.env.NODE_ENV === "production" && !usePostgres) {
+  throw new Error("DATABASE_URL is required in production; refusing to start with a local SQLite database.");
+}
+const HOST = usePostgres ? "0.0.0.0" : "127.0.0.1";
 const SESSION_COOKIE = "capitol_session";
 const SESSION_MS = 8 * 60 * 60 * 1000;
 const DEFAULT_CATEGORIES = ["Dry", "Chemical", "Protein", "Fruit", "Vegetable", "Other"];
@@ -69,9 +74,15 @@ const WATER_REQUESTERS = [
   "Matthew Armah",
 ];
 const WATER_EXEMPT = new Set([28, 29, 30, 31, 32, 36, 38, 39].map(number => `Room ${number}`));
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new DatabaseSync(DB_PATH);
-db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+let db;
+if (usePostgres) {
+  db = new PostgresDatabase(process.env.DATABASE_URL);
+} else {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  db = new DatabaseSync(DB_PATH);
+  db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+}
+if (!usePostgres) {
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -335,6 +346,7 @@ if (!db.prepare("SELECT 1 FROM settings WHERE key = 'inventory_store_migration_v
     db.prepare("INSERT INTO settings (key, value) VALUES ('inventory_store_migration_v2', '1')").run();
   });
 }
+}
 
 const sessions = new Map();
 const loginAttempts = new Map();
@@ -380,6 +392,10 @@ function optionalDate(value, label) {
 
 function httpError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
+}
+
+function isUniqueConstraintError(error) {
+  return error.code === "23505" || (error.code === "ERR_SQLITE_ERROR" && /UNIQUE constraint failed/i.test(error.message));
 }
 
 function validateEmail(value) {
@@ -438,16 +454,21 @@ function currentSession(request) {
 }
 
 function setSessionCookie(response, id) {
-  response.setHeader("Set-Cookie", `${SESSION_COOKIE}=${encodeURIComponent(id)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(SESSION_MS / 1000)}`);
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  response.setHeader("Set-Cookie", `${SESSION_COOKIE}=${encodeURIComponent(id)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(SESSION_MS / 1000)}${secure}`);
 }
 
 function clearSessionCookie(response) {
-  response.setHeader("Set-Cookie", `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  response.setHeader("Set-Cookie", `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`);
 }
 
 function ensureSameOrigin(request) {
   const origin = request.headers.origin;
-  if (origin && origin !== `http://${HOST}:${PORT}` && origin !== `http://localhost:${PORT}`) {
+  const forwardedHost = String(request.headers["x-forwarded-host"] || request.headers.host || "").split(",")[0].trim();
+  const forwardedProto = String(request.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
+  const requestOrigin = `${forwardedProto}://${forwardedHost}`;
+  if (origin && origin !== requestOrigin && origin !== `http://127.0.0.1:${PORT}` && origin !== `http://localhost:${PORT}`) {
     throw httpError(403, "Cross-origin requests are not allowed.");
   }
 }
@@ -524,6 +545,7 @@ function userView(user) {
     displayName: user.display_name,
     role: user.role,
     active: Boolean(user.active),
+    passwordResetRequired: Boolean(user.password_reset_required),
     createdAt: user.created_at,
   };
 }
@@ -608,7 +630,7 @@ function addInventoryColumn(body, actor) {
     db.prepare("INSERT INTO inventory_columns (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)")
       .run(id, name, now, now);
   } catch (error) {
-    if (error.code === "ERR_SQLITE_ERROR" && /UNIQUE constraint failed/i.test(error.message)) {
+    if (isUniqueConstraintError(error)) {
       throw httpError(409, "An inventory column with that name already exists.");
     }
     throw error;
@@ -626,7 +648,7 @@ function updateInventoryColumn(id, body, actor) {
     db.prepare("UPDATE inventory_columns SET name = ?, active = ?, updated_at = ? WHERE id = ?")
       .run(name, active ? 1 : 0, nowIso(), id);
   } catch (error) {
-    if (error.code === "ERR_SQLITE_ERROR" && /UNIQUE constraint failed/i.test(error.message)) {
+    if (isUniqueConstraintError(error)) {
       throw httpError(409, "An inventory column with that name already exists.");
     }
     throw error;
@@ -1973,6 +1995,12 @@ function createUser(body, actor) {
 }
 
 function validateNewPassword(password) {
+  if (usePostgres) {
+    if (typeof password !== "string" || !/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{12,128}$/.test(password)) {
+      throw httpError(400, "Cloud passwords must be 12–128 characters and include an uppercase letter, a lowercase letter, and a number.");
+    }
+    return;
+  }
   if (typeof password !== "string" || !/^\d{4}$/.test(password)) {
     throw httpError(400, "Password must be exactly four numbers.");
   }
@@ -2015,8 +2043,16 @@ function resetUserPassword(id, body, actor) {
   if (!user) throw httpError(404, "User not found.");
   validateNewPassword(body?.password);
   const salt = crypto.randomBytes(16).toString("hex");
-  db.prepare("UPDATE users SET password_salt = ?, password_hash = ? WHERE id = ?")
-    .run(salt, passwordHash(body.password, salt), id);
+  if (usePostgres) {
+    transaction(() => {
+      db.prepare("UPDATE users SET password_salt = ?, password_hash = ?, password_reset_required = 0 WHERE id = ?")
+        .run(salt, passwordHash(body.password, salt), id);
+      db.prepare("DELETE FROM login_attempts WHERE user_id = ?").run(id);
+    });
+  } else {
+    db.prepare("UPDATE users SET password_salt = ?, password_hash = ? WHERE id = ?")
+      .run(salt, passwordHash(body.password, salt), id);
+  }
   addAudit(actor, "user.password_reset", user.username);
   return { updated: true };
 }
@@ -2110,6 +2146,7 @@ function publicBootstrap(request) {
   const session = currentSession(request);
   const base = {
     setupRequired: adminCount === 0,
+    passwordPolicy: usePostgres ? "strong" : "pin",
     categories: getCategories().map(category => category.name),
     stores: getLocations().map(location => location.name),
     inventoryColumns: getInventoryColumns(),
@@ -2161,9 +2198,14 @@ function asyncRoute(handler) {
       if (response.writableEnded) return;
       sendJson(response, result?.statusCode || 200, result?.body ?? result);
     } catch (error) {
-      const status = error.statusCode || 500;
+      const status = error.statusCode || (usePostgres && error.code === "23505" ? 409 : 500);
       if (status >= 500) console.error("Request failed:", error);
-      if (!response.headersSent && !response.destroyed) sendJson(response, status, { error: status >= 500 ? "A local server error occurred. Check the server window for details." : error.message });
+      const message = status === 409
+        ? "A record with the same unique value already exists."
+        : status >= 500
+          ? "A server error occurred. Please try again or contact an administrator."
+          : error.message;
+      if (!response.headersSent && !response.destroyed) sendJson(response, status, { error: message });
     }
   };
 }
@@ -2193,21 +2235,51 @@ route("POST", "/api/setup", (_request, _response, body) => {
   return { body: { created: true } };
 });
 route("POST", "/api/login", (request, response, body) => {
-  const key = `${request.socket.remoteAddress}:${String(body.username || "").toLowerCase()}`;
-  const attempts = loginAttempts.get(key) || { count: 0, since: Date.now() };
+  const username = String(body.username || "").trim();
+  let user = db.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE AND active = 1").get(username);
+  const key = user ? user.id : username.toLowerCase();
+  const storedAttempts = usePostgres && user
+    ? db.prepare("SELECT failures AS count, window_started_at AS since FROM login_attempts WHERE user_id = ?").get(user.id)
+    : loginAttempts.get(key);
+  const attempts = storedAttempts
+    ? { count: Number(storedAttempts.count), since: Number(storedAttempts.since) }
+    : { count: 0, since: Date.now() };
   if (Date.now() - attempts.since > 15 * 60_000) {
     attempts.count = 0;
     attempts.since = Date.now();
   }
   if (attempts.count >= 8) throw httpError(429, "Too many sign-in attempts. Wait 15 minutes and try again.");
-  const user = db.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE AND active = 1").get(String(body.username || "").trim());
   const valid = user && passwordMatches(String(body.password || ""), user.password_salt, user.password_hash);
   if (!valid) {
     attempts.count += 1;
-    loginAttempts.set(key, attempts);
+    if (usePostgres && user) {
+      db.prepare(`
+        INSERT INTO login_attempts (user_id, failures, window_started_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE
+        SET failures = excluded.failures, window_started_at = excluded.window_started_at
+      `).run(user.id, attempts.count, attempts.since);
+    } else if (!usePostgres) {
+      loginAttempts.set(key, attempts);
+    }
     throw httpError(401, "Username or password is incorrect.");
   }
-  loginAttempts.delete(key);
+  if (usePostgres && user.password_reset_required) {
+    if (!body.newPassword) return { body: { passwordResetRequired: true } };
+    validateNewPassword(body.newPassword);
+    const salt = crypto.randomBytes(16).toString("hex");
+    transaction(() => {
+      db.prepare("UPDATE users SET password_salt = ?, password_hash = ?, password_reset_required = 0 WHERE id = ?")
+        .run(salt, passwordHash(body.newPassword, salt), user.id);
+      db.prepare("DELETE FROM login_attempts WHERE user_id = ?").run(user.id);
+    });
+    addAudit(user, "auth.password_reset_required", "Replaced the imported PIN with a cloud password.");
+    user = db.prepare("SELECT * FROM users WHERE id = ? AND active = 1").get(user.id);
+  } else if (usePostgres) {
+    db.prepare("DELETE FROM login_attempts WHERE user_id = ?").run(user.id);
+  } else {
+    loginAttempts.delete(key);
+  }
   const sessionId = crypto.randomBytes(32).toString("base64url");
   const csrfToken = crypto.randomBytes(32).toString("base64url");
   sessions.set(sessionId, { userId: user.id, role: user.role, csrfToken, expiresAt: Date.now() + SESSION_MS });
@@ -2678,7 +2750,13 @@ const server = http.createServer((request, response) => {
   }
   if (pathname.startsWith("/api/")) {
     if (pathname === "/api/health" && request.method === "GET") {
-      sendJson(response, 200, { ok: true, sqlite: true });
+      try {
+        db.prepare("SELECT 1 AS ok").get();
+        sendJson(response, 200, { ok: true, database: usePostgres ? "postgres" : "sqlite", sqlite: !usePostgres });
+      } catch (error) {
+        console.error("Health check failed:", error.message);
+        sendJson(response, 503, { ok: false });
+      }
       return;
     }
     const handler = findRoute(request.method, pathname);
@@ -2702,8 +2780,8 @@ server.on("error", error => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Capitol Stock Management is ready at http://${HOST}:${PORT}`);
-  console.log(`Local SQLite database: ${DB_PATH}`);
+  console.log(`Capitol Stock Management is ready on ${HOST}:${PORT}`);
+  console.log(usePostgres ? "Connected to the hosted PostgreSQL database." : `Local SQLite database: ${DB_PATH}`);
 });
 
 function shutdown() {
