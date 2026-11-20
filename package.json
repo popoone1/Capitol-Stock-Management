@@ -1,0 +1,72 @@
+{
+  "name": "capitol-stock-management",
+  "version": "1.0.3",
+  "private": true,
+  "description": "Local-first desktop stock, requisition, water tracking and reporting app.",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check app.js && node --check electron-main.js && node --check scripts/download-node.js && node --check scripts/create-windows-icon.js",
+    "package:win": "npm run check && node scripts/create-windows-icon.js && node scripts/download-node.js && electron-builder --win nsis"
+  },
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "dependencies": {
+    "bootstrap": "^5.3.8",
+    "nodemailer": "^10.3.0"
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.capitol.stockmanagement",
+    "productName": "Capitol Stock Management",
+    "asar": false,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron-main.js",
+      "server.js",
+      "app.js",
+      "styles.css",
+      "index.html",
+      "assets/**/*",
+      "!data/**/*",
+      "node_modules/bootstrap/dist/css/bootstrap.min.css",
+      "node_modules/bootstrap/dist/js/bootstrap.bundle.min.js",
+      "node_modules/bootstrap/LICENSE",
+      "node_modules/nodemailer/**/*",
+      "assets/capitol-catering-logo.ico",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/node-runtime",
+        "to": "node-runtime",
+        "filter": [
+          "node.exe",
+          "LICENSE",
+          "README.md"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "signAndEditExecutable": false,
+      "icon": "assets/capitol-catering-logo.ico",
+      "artifactName": "Capitol-Stock-Management-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
