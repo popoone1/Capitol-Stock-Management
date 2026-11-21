@@ -1,6 +1,6 @@
 {
   "name": "capitol-stock-management",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "description": "Local-first desktop stock, requisition, water tracking and reporting app.",
   "main": "electron-main.js",
@@ -14,6 +14,7 @@
     "node": ">=24.15.0"
   },
   "dependencies": {
+    "@chenglou/pretext": "^1.0.0",
     "bootstrap": "^5.3.8",
     "nodemailer": "^10.3.0",
     "pg": "^8.16.3"
@@ -42,6 +43,8 @@
       "node_modules/bootstrap/dist/css/bootstrap.min.css",
       "node_modules/bootstrap/dist/js/bootstrap.bundle.min.js",
       "node_modules/bootstrap/LICENSE",
+      "node_modules/@chenglou/pretext/dist/**/*",
+      "node_modules/@chenglou/pretext/LICENSE",
       "node_modules/nodemailer/**/*",
       "assets/capitol-catering-logo.ico",
       "package.json"

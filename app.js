@@ -2,6 +2,7 @@ const state = {
   bootstrap: null,
   page: "Dashboard",
   inventory: { items: [], locations: [] },
+  inventoryArchives: [],
   archivedItems: [],
   inventorySection: "active",
   issueItems: [],
@@ -16,22 +17,48 @@ const state = {
   reportSpec: null,
   itemDraft: null,
   openStore: "Dry Store",
+  openInventoryArchive: "",
+  openArchiveStore: "",
   openRequestStore: "All Stock Requests",
   busy: false,
   movementFilters: null,
   auditor: null,
+  appearanceDraft: null,
+  connection: "checking",
+  connectionTimer: null,
   theme: localStorage.getItem("capitol-theme") === "dark" ? "dark" : "light",
 };
 
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
 const WATER_EXEMPT = new Set([28, 29, 30, 31, 32, 36, 38, 39].map(room => `Room ${room}`));
-const ACCENT_COLORS = {
-  teal: ["#1a9b88", "#127d70"],
-  blue: ["#3977d5", "#285bb0"],
-  violet: ["#7857c5", "#5a3ea0"],
-  orange: ["#d77b32", "#ae5d20"],
+const APPEARANCE_FONTS = {
+  inter: "Inter",
+  manrope: "Manrope",
+  "dm-sans": "DM Sans",
+  roboto: "Roboto",
+  lato: "Lato",
+  "source-sans-3": "Source Sans 3",
+  "nunito-sans": "Nunito Sans",
+  "ibm-plex-sans": "IBM Plex Sans",
+  merriweather: "Merriweather",
+  lora: "Lora",
+  "atkinson-hyperlegible": "Atkinson Hyperlegible",
 };
+const APPEARANCE_COLOR_FIELDS = [
+  ["text", "Body text"],
+  ["muted", "Secondary text"],
+  ["heading", "Headings"],
+  ["background", "Page background"],
+  ["surface", "Cards and panels"],
+  ["border", "Borders"],
+  ["accent", "Accent gradient start"],
+  ["accentStrong", "Accent gradient end"],
+];
+let pretextLayout;
+const pretextReady = import("/vendor/pretext/layout.js")
+  .then(module => { pretextLayout = module; })
+  .catch(error => { console.error("Pretext text preview could not be loaded:", error); });
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -153,7 +180,8 @@ function field(label, id, type = "text", options = {}) {
       const value = typeof choice === "string" ? choice : choice.value;
       const text = typeof choice === "string" ? choice : choice.label;
       const selected = String(value) === String(options.value ?? options.defaultValue ?? "");
-      return `<option value="${esc(value)}" ${selected ? "selected" : ""}>${esc(text)}</option>`;
+      const disabled = typeof choice === "object" && choice.disabled ? "disabled" : "";
+      return `<option value="${esc(value)}" ${selected ? "selected" : ""} ${disabled}>${esc(text)}</option>`;
     }).join("");
     return `<label class="form-field"><span>${label}</span><select id="${id}" name="${esc(options.name || id)}" ${options.required ? "required" : ""}>${choices}</select></label>`;
   }
@@ -193,6 +221,118 @@ function button(text, action, options = {}) {
   return `<button type="${options.type || "button"}" class="${classes}" ${action ? `data-action="${action}"` : ""} ${options.disabled ? "disabled" : ""}>${text}</button>`;
 }
 
+function currentAppearance() {
+  return state.appearanceDraft || state.bootstrap.appearance;
+}
+
+function applyAppearance() {
+  if (!state.bootstrap?.appearance) return;
+  const appearance = currentAppearance();
+  const family = APPEARANCE_FONTS[appearance.fontFamily] || APPEARANCE_FONTS.inter;
+  const colors = appearance.themes?.[state.theme] || appearance.themes?.light;
+  app.dataset.theme = state.theme;
+  app.dataset.fontFamily = appearance.fontFamily || "inter";
+  app.dataset.fontWeight = appearance.fontWeight || "600";
+  app.dataset.glass = appearance.style === "classic" ? "off" : "on";
+  app.style.setProperty("--app-font-family", `"${family}", Inter, Arial, sans-serif`);
+  app.style.setProperty("--font-scale", String(appearance.fontScale || 1));
+  app.style.setProperty("--app-font-weight", String(appearance.fontWeight || "600"));
+  for (const [theme, values] of Object.entries(appearance.themes || {})) {
+    for (const [field, value] of Object.entries(values)) {
+      app.style.setProperty(`--${theme}-${field}`, value);
+    }
+  }
+  app.style.setProperty("--ink", colors.text);
+  app.style.setProperty("--muted", colors.muted);
+  app.style.setProperty("--heading", colors.heading);
+  app.style.setProperty("--canvas", colors.background);
+  app.style.setProperty("--paper", colors.surface);
+  app.style.setProperty("--line", colors.border);
+  app.style.setProperty("--teal", colors.accent);
+  app.style.setProperty("--teal-dark", colors.accentStrong);
+}
+
+function connectionMarkup() {
+  const labels = {
+    checking: "Checking connection",
+    connected: "System connected",
+    disconnected: "System disconnected",
+  };
+  return `<span class="network-status ${state.connection}" role="status" aria-label="${labels[state.connection]}" aria-live="polite"><i aria-hidden="true"></i><strong>${labels[state.connection]}</strong></span>`;
+}
+
+function updateConnectionStatus() {
+  const status = document.querySelector(".network-status");
+  if (!status) return;
+  status.className = `network-status ${state.connection}`;
+  const label = ({
+    checking: "Checking connection",
+    connected: "System connected",
+    disconnected: "System disconnected",
+  })[state.connection];
+  status.setAttribute("aria-label", label);
+  status.querySelector("strong").textContent = label;
+}
+
+async function checkConnection() {
+  if (!navigator.onLine) {
+    state.connection = "disconnected";
+    updateConnectionStatus();
+    return;
+  }
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch("/api/health", { cache: "no-store", signal: controller.signal });
+    const health = await response.json();
+    state.connection = response.ok && health.ok ? "connected" : "disconnected";
+  } catch (error) {
+    state.connection = "disconnected";
+    if (error.name !== "AbortError") console.warn("Connection health check failed:", error.message);
+  } finally {
+    window.clearTimeout(timeout);
+    updateConnectionStatus();
+  }
+}
+
+function startConnectionMonitor() {
+  if (state.connectionTimer) return;
+  const checkAndSync = async () => {
+    await checkConnection();
+    await syncSharedAppearance();
+  };
+  void checkAndSync();
+  state.connectionTimer = window.setInterval(checkAndSync, 30_000);
+  window.addEventListener("online", checkAndSync);
+  window.addEventListener("offline", () => {
+    state.connection = "disconnected";
+    updateConnectionStatus();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void checkConnection();
+  });
+}
+
+async function syncSharedAppearance() {
+  if (state.connection !== "connected" || !state.bootstrap?.user || state.appearanceDraft) return;
+  try {
+    const refreshed = await api("/api/bootstrap");
+    if (!refreshed.user) {
+      state.bootstrap = refreshed;
+      showLogin();
+      return;
+    }
+    if (JSON.stringify(refreshed.appearance) === JSON.stringify(state.bootstrap.appearance)) return;
+    state.bootstrap = { ...state.bootstrap, ...refreshed };
+    applyAppearance();
+    if (state.page === "Admin" && state.adminSection === "Appearance") {
+      render(renderAdmin(await api("/api/admin")));
+    }
+  } catch (error) {
+    console.warn("Shared appearance could not be refreshed:", error.message);
+  }
+}
+
 function shell(content) {
   const user = state.bootstrap.user;
   const nav = [
@@ -212,31 +352,25 @@ function shell(content) {
     if (group) lastGroup = group;
     return `${separator}<button class="nav-item ${state.page === name ? "active" : ""}" data-page="${esc(name)}"><span>${icon}</span>${esc(name)}</button>`;
   }).join("");
-  app.dataset.theme = state.theme;
-  const appearance = state.bootstrap.appearance || { accent: "teal", textSize: "normal" };
-  const [accent, accentDark] = ACCENT_COLORS[appearance.accent] || ACCENT_COLORS.teal;
-  app.dataset.textSize = appearance.textSize === "large" ? "large" : "normal";
-  app.dataset.fontFamily = appearance.fontFamily === "manrope" ? "manrope" : "inter";
-  app.dataset.glass = appearance.style === "classic" ? "off" : "on";
-  app.style.setProperty("--teal", accent);
-  app.style.setProperty("--teal-dark", accentDark);
   app.innerHTML = `<div class="app-shell">
     <aside class="sidebar">
       <a href="#" class="brand" data-page="Dashboard"><span class="brand-mark"><img src="/assets/capitol-catering-icon.png" alt="Capitol Catering"></span><span><strong>CAPITOL</strong><small>STOCK MANAGEMENT</small></span></a>
-      <div class="workspace-card"><span class="workspace-symbol">C</span><span><strong>Capitol Stores</strong><small>Local workspace</small></span><i class="online-dot"></i></div>
+      <div class="workspace-card"><span class="workspace-symbol">C</span><span><strong>Capitol Stores</strong><small>${state.bootstrap.passwordPolicy === "strong" ? "Shared workspace" : "Private workspace"}</small></span><i class="online-dot"></i></div>
       <nav class="primary-nav" aria-label="Main navigation">${navMarkup}</nav>
-      <div class="sidebar-callout"><span>✦</span><strong>Stock, clearly.</strong><p>Local inventory and water distribution in one place.</p></div>
+      <div class="sidebar-callout"><span>✦</span><strong>Stock, clearly.</strong><p>Inventory, requisitions and distribution in one place.</p></div>
       <div class="sidebar-bottom">
         <div class="user-card"><span class="user-avatar">${esc(user.displayName.split(/\s+/).slice(0, 2).map(part => part[0]).join("").toUpperCase())}</span><span><strong>${esc(user.displayName)}</strong><small>${user.role === "admin" ? "Administrator" : user.role === "auditor" ? "Auditor · read only" : "Standard user"}</small></span></div>
-        <div class="local-note"><i></i> DATA STAYS ON THIS PC</div>
+        <div class="local-note"><i></i> ${state.bootstrap.passwordPolicy === "strong" ? "SHARED WORKSPACE" : "PRIVATE WORKSPACE"}</div>
       </div>
     </aside>
     <main class="main-shell">
-      <header class="topbar"><div><div class="breadcrumb"><span>Capitol</span><span>/</span><strong>${esc(state.page)}</strong></div><p>Inventory, requisitions &amp; distribution</p></div><div class="topbar-right"><button type="button" class="theme-toggle" data-action="toggle-theme" aria-label="Switch to ${state.theme === "dark" ? "light" : "dark"} theme" title="Switch theme">${state.theme === "dark" ? "☀" : "☾"}</button><span class="today-chip"><i></i>${prettyDate(dateKey())}</span><span class="avatar" title="${esc(user.displayName)}">${esc(user.displayName.split(/\s+/).slice(0, 2).map(part => part[0]).join("").toUpperCase())}</span><button type="button" class="topbar-logout" data-action="logout">Log out</button></div></header>
+      <header class="topbar"><div><div class="breadcrumb"><span>Capitol</span><span>/</span><strong>${esc(state.page)}</strong></div><p>Inventory, requisitions &amp; distribution</p></div><div class="topbar-right">${connectionMarkup()}<button type="button" class="refresh-button" data-action="refresh" aria-label="Refresh current section" title="Refresh current section">↻<span>Refresh</span></button><button type="button" class="theme-toggle" data-action="toggle-theme" aria-label="Switch to ${state.theme === "dark" ? "light" : "dark"} theme" title="Switch theme">${state.theme === "dark" ? "☀" : "☾"}</button><span class="today-chip"><i></i>${prettyDate(dateKey())}</span><span class="avatar" title="${esc(user.displayName)}">${esc(user.displayName.split(/\s+/).slice(0, 2).map(part => part[0]).join("").toUpperCase())}</span><button class="topbar-logout" data-action="logout">Log out</button></div></header>
       <section id="page-content" class="page-content">${content}</section>
-      <footer class="footer"><span><i></i> Private local workspace</span><span>CAPITOL STOCK MANAGEMENT</span></footer>
+      <footer class="footer"><span><i></i> ${state.bootstrap.passwordPolicy === "strong" ? "Shared workspace" : "Private workspace"}</span><span>CAPITOL STOCK MANAGEMENT</span></footer>
     </main>
   </div><div id="modal-root"></div>`;
+  applyAppearance();
+  if (state.page === "Admin" && state.adminSection === "Appearance") updateAppearancePreview();
 }
 
 function pageHeading(kicker, title, description, actions = "") {
@@ -338,11 +472,37 @@ function renderInventory(data) {
     const columnCount = 8 + columns.length + (admin ? 1 : 0);
     return `<section class="store-section"><button type="button" class="store-toggle ${expanded ? "active" : ""}" data-store-toggle="${esc(store)}" aria-expanded="${expanded}"><span>${esc(store)}</span><span class="store-count">${storeItems.length} ${storeItems.length === 1 ? "item" : "items"}</span><span class="store-chevron">${expanded ? "−" : "+"}</span></button><div class="store-content" ${expanded ? "" : "hidden"}><div class="table-scroll"><table class="data-table wide-table"><thead>${headings}</thead><tbody>${rows || `<tr><td colspan="${columnCount}"><div class="empty-state"><span>▦</span><strong>No items in ${esc(store)}</strong><p>${admin ? "Add an item and assign it to this store." : "Ask an administrator to add an item to this store."}</p></div></td></tr>`}</tbody></table></div></div></section>`;
   }).join("");
+  const archiveMarkup = (state.inventoryArchives || []).map(archive => {
+    const archiveOpen = state.openInventoryArchive === archive.month;
+    const monthLabel = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
+      .format(new Date(`${archive.month}-01T00:00:00Z`));
+    const archiveStores = archive.stores.map(store => {
+      const key = `${archive.month}::${store}`;
+      const expanded = state.openArchiveStore === key;
+      const archiveColumns = archive.inventoryColumns || [];
+      const storeItems = archive.items.filter(item => item.store === store &&
+        (!category || item.category === category) &&
+        (!query || `${item.name} ${item.sku}`.toLowerCase().includes(query.toLowerCase())));
+      const archiveRows = storeItems.map(item => `<tr>
+        <td><span class="sku">${esc(item.sku)}</span></td><td><span class="item-name">${esc(item.name)}</span></td>
+        <td>${number(item.previous_month_quantity)}</td><td>${number(item.received_stock_quantity)}</td>
+        <td>${number(item.current_quantity)}</td><td>${number(item.removed)}</td>
+        <td><strong>${number(item.remainder)}</strong><small class="cell-sub">${esc(item.unit)}</small></td>
+        <td><span class="pill ${esc(item.status_color)}">${number(item.status_percent, 1)}%</span></td>
+        ${archiveColumns.map(column => `<td>${esc(item.custom_values?.[column.id] || "—")}</td>`).join("")}
+      </tr>`).join("");
+      const count = 8 + archiveColumns.length;
+      const archiveHeadings = `<tr><th>SKU</th><th>ITEM</th><th>PREVIOUS MONTH STOCK QUANTITY</th><th>RECEIVED STOCK QUANTITY</th><th>CURRENT QUANTITY</th><th>REMOVED</th><th>REMAINDER</th><th>STATUS</th>${archiveColumns.map(column => `<th>${esc(column.name)}</th>`).join("")}</tr>`;
+      return `<section class="store-section archive-store-section"><button type="button" class="store-toggle ${expanded ? "active" : ""}" data-archive-store="${esc(key)}" aria-expanded="${expanded}"><span>${esc(store)}</span><span class="store-count">${storeItems.length} ${storeItems.length === 1 ? "item" : "items"}</span><span class="store-chevron">${expanded ? "−" : "+"}</span></button><div class="store-content" ${expanded ? "" : "hidden"}><div class="table-scroll"><table class="data-table wide-table"><thead>${archiveHeadings}</thead><tbody>${archiveRows || `<tr><td colspan="${count}"><div class="empty-state"><strong>No items in ${esc(store)}</strong><p>No inventory was recorded for this store that month.</p></div></td></tr>`}</tbody></table></div></div></section>`;
+    }).join("");
+    return `<section class="store-section archive-month-section"><button type="button" class="store-toggle archive-month-toggle ${archiveOpen ? "active" : ""}" data-inventory-archive="${esc(archive.month)}" aria-expanded="${archiveOpen}"><span>${esc(monthLabel)} Inventory</span><span class="store-count">${archive.items.length} items</span><span class="store-chevron">${archiveOpen ? "−" : "+"}</span></button><div class="store-content archive-month-content" ${archiveOpen ? "" : "hidden"}><div class="store-list">${archiveStores}</div><div class="table-note">Archived month-end stock. Remainder is the closing balance for this month.</div></div></section>`;
+  }).join("");
   const archiveButton = admin ? `<button type="button" class="button secondary" data-action="show-archive">Archived items (${state.archivedItems?.length || 0})</button>` : "";
   return `${pageHeading("CATALOG & BALANCES", "Inventory", "Search item balances across your store locations.", `${addButton}${archiveButton}`)}
     <section class="card inventory-card">
       <div class="table-toolbar"><label class="search-input"><span>⌕</span><input id="inventory-search" placeholder="Search SKU or item name" value="${esc(query)}" /></label><select id="inventory-category"><option value="">All categories</option>${categoryOptions(category)}</select><span class="result-count">${items.length} active items</span></div>
       <div class="store-list">${storesMarkup}</div>
+      ${archiveMarkup ? `<div class="inventory-month-archives"><div class="archive-heading"><span class="section-label">MONTHLY INVENTORY ARCHIVES</span><p>Month-end balances by store. The latest archive also seeds the current month’s previous-stock quantity.</p></div><div class="store-list">${archiveMarkup}</div></div>` : ""}
       <div class="table-note">Removed is the total issued or otherwise removed this month. Remainder equals current quantity minus removed. Status shows the remaining percentage; green 80–100%, yellow 20–70%, red 0–10%.</div>
     </section>`;
 }
@@ -385,11 +545,17 @@ function renderDepartmentFields(department = "") {
 function itemSelectOptions(locationId = "") {
   const location = state.inventory.locations.find(entry => entry.id === locationId);
   const items = state.issueItems.filter(item =>
-    item.active && item.on_hand > 0 && location && item.store === location.name,
+    item.active && location && item.store === location.name,
   );
   return [
     { value: "", label: location ? "Choose stock item" : "Choose a store location first" },
-    ...items.map(item => ({ value: item.id, label: `${item.name} · ${item.sku} · ${number(item.on_hand)} ${item.unit}` })),
+    ...items.map(item => ({
+      value: item.id,
+      label: item.on_hand > 0
+        ? `${item.name} · ${item.sku} · ${number(item.on_hand)} ${item.unit}`
+        : `${item.name} · ${item.sku} · Out of stock`,
+      disabled: item.on_hand <= 0,
+    })),
   ];
 }
 
@@ -404,7 +570,7 @@ function renderIssue() {
           <div class="form-grid two-col">${field("DEPARTMENT *", "department", "text", { required: true, select: ["", ...state.bootstrap.departments.map(value => ({ value, label: value }))] })}${field("STORE LOCATION *", "locationId", "text", { required: true, select: [{ value: "", label: "Choose location" }, ...state.inventory.locations.map(location => ({ value: location.id, label: location.name }))] })}${field("REQUEST DATE *", "date", "date", { required: true, value: dateKey() })}${field("ISSUED BY *", "issuedBy", "text", { required: true, maxlength: 120, value: state.bootstrap.user.displayName, placeholder: "Name of issuing staff" })}<div class="department-fields" id="department-fields"></div><label class="form-field wide-field"><span>NOTES</span><textarea name="notes" rows="2" maxlength="1000" placeholder="Optional delivery or request notes"></textarea></label></div>
         </section>
         <section class="card issue-card"><div class="form-section-title"><span>02</span><div><h2>Items to issue</h2><p>Available stock is deducted using earliest-expiring batches first.</p></div></div>
-          <div class="line-entry">${field("ITEM *", "line-item", "text", { select: itemSelectOptions(selectedLocation) })}${field("QUANTITY *", "line-quantity", "number", { min: "0.001", step: "0.001", value: 1, required: true })}<button type="button" class="button secondary" data-action="add-line">Add line</button></div>
+          <div class="line-entry">${field("ITEM *", "line-item", "text", { select: itemSelectOptions(selectedLocation) })}${field("QUANTITY *", "line-quantity", "number", { min: "0.001", step: "0.001", value: 1, required: true })}<button type="button" class="button secondary" data-action="add-line">Add line</button></div><p class="hint-line">Out-of-stock items remain visible for reference but cannot be selected.</p>
           <div id="issue-lines" class="selected-lines"><div class="empty-lines">Select an item and add it to this requisition.</div></div>
           <label class="form-field"><span>ISSUE TYPE</span><div class="kind-note" id="issue-kind-note">Regular department requisition</div></label>
         </section>
@@ -418,6 +584,7 @@ function renderIssue() {
 function addIssueLine(itemId, quantity) {
   const item = state.issueItems.find(entry => entry.id === itemId);
   if (!item) throw new Error("Choose an item from the stock catalog.");
+  if (item.on_hand <= 0) throw new Error("This item is out of stock and cannot be issued.");
   const locationId = document.querySelector('#stock-issue-form [name="locationId"]')?.value || "";
   const location = state.inventory.locations.find(entry => entry.id === locationId);
   if (!location) throw new Error("Choose a store location before selecting stock items.");
@@ -643,6 +810,35 @@ function voidMovementModal(movement, isRequest = false) {
   return `<div class="modal-backdrop" data-action="close-modal"><section class="modal small-modal" role="dialog" aria-modal="true" aria-labelledby="modal-heading"><div class="modal-heading"><div><span class="section-label">AUDIT-SAFE REVERSAL</span><h2 id="modal-heading">${label}</h2><p>${esc(movement.item_name)} · ${number(quantity)} ${esc(movement.unit)}. The original remains in the movement audit and stock is restored.</p></div><button type="button" class="modal-close" data-action="close-modal">×</button></div><form id="${formId}" ${formData}>${field("REASON FOR REVERSAL *", "reason", "text", { required: true, minlength: 3, maxlength: 500, placeholder: "Explain the correction" })}<div class="modal-actions"><button type="button" class="button secondary" data-action="close-modal">Cancel</button><button type="submit" class="button danger">${action}</button></div></form></section></div>`;
 }
 
+function textScaleLabel(scale) {
+  if (scale < 0.85) return "Small";
+  if (scale < 0.98) return "Smaller";
+  if (scale <= 1.08) return "Standard";
+  if (scale < 1.4) return "Larger";
+  return "Very big";
+}
+
+function renderAppearanceSettings(settings) {
+  const appearance = state.appearanceDraft || settings.appearance;
+  const fontOptions = Object.entries(APPEARANCE_FONTS).map(([value, label]) => ({ value, label }));
+  const themeCards = ["light", "dark"].map(theme => {
+    const colors = appearance.themes[theme];
+    const controls = APPEARANCE_COLOR_FIELDS.map(([fieldName, label]) => {
+      const inputName = `${theme}${fieldName[0].toUpperCase()}${fieldName.slice(1)}`;
+      return `<label class="appearance-color-field"><span>${label}</span><input type="color" name="${inputName}" value="${esc(colors[fieldName])}" aria-label="${theme} ${label} color"><output>${esc(colors[fieldName])}</output></label>`;
+    }).join("");
+    const title = theme === "light" ? "Light theme" : "Dark theme";
+    return `<section class="appearance-theme-card ${theme}" aria-label="${title} appearance colors"><div class="appearance-theme-heading"><h3>${title}</h3><span>Applies only in ${theme} mode</span></div><div class="appearance-color-grid">${controls}</div><div class="appearance-preview-sample" data-appearance-preview="${theme}"><strong>Clear, comfortable text</strong><span>Inventory, stock updates and requisitions stay readable in every section.</span></div></section>`;
+  }).join("");
+  const scale = Number(appearance.fontScale || 1);
+  return `<section class="card admin-card appearance-card"><div class="panel-heading"><div><span class="section-label">WORKSPACE DESIGN</span><h2>Typography and colors</h2><p>Preview changes instantly across the whole app. Save to share them with every user and session.</p></div><span class="count-chip">Shared settings</span></div><form id="appearance-form" class="stack-form">
+    <div class="form-grid two-col">${field("TYPOGRAPHY", "fontFamily", "text", { required: true, select: fontOptions, value: appearance.fontFamily })}${field("FONT WEIGHT", "fontWeight", "text", { required: true, select: [{ value: "400", label: "Regular" }, { value: "500", label: "Medium" }, { value: "600", label: "Semi-bold" }, { value: "700", label: "Bold" }, { value: "800", label: "Extra bold" }], value: appearance.fontWeight })}${field("SURFACE STYLE", "style", "text", { required: true, select: [{ value: "glass", label: "Soft glass" }, { value: "classic", label: "Classic solid" }], value: appearance.style })}</div>
+    <section class="appearance-scale"><div class="appearance-scale-heading"><label for="appearance-font-scale">SYSTEM TEXT SIZE</label><output id="font-scale-value" for="appearance-font-scale">${textScaleLabel(scale)} · ${Math.round(scale * 100)}%</output></div><input id="appearance-font-scale" name="fontScale" type="range" min="0.75" max="1.75" step="0.05" value="${scale}" aria-label="System text size"><div class="appearance-scale-labels"><span>Small</span><span>Smaller</span><span>Standard</span><span>Larger</span><span>Very big</span></div><p>Drag the slider to resize text across every section. Layouts wrap and scroll to fit larger sizes.</p></section>
+    <div class="appearance-theme-grid">${themeCards}</div>
+    <div class="appearance-live-preview"><div><span class="section-label">LIVE TYPE PREVIEW</span><p class="appearance-preview-copy">The right typography and contrast make every stock decision easier to read.</p><small id="pretext-layout-result" aria-live="polite">Measuring text layout…</small></div><button type="submit" class="button primary">Save appearance</button></div>
+  </form></section>`;
+}
+
 function renderAdmin(data = state.admin) {
   if (!data) return `<div class="loading-content"><span class="spinner"></span> Loading admin settings…</div>`;
   state.admin = data;
@@ -670,12 +866,12 @@ function renderAdmin(data = state.admin) {
   } else if (state.adminSection === "Email") {
     content = `<section class="card admin-card email-config"><div class="panel-heading"><div><span class="section-label">GMAIL DELIVERY</span><h2>Report email settings</h2><p>Generate reports locally, then send them as CSV attachments through Gmail.</p></div><span class="mail-icon">✉</span></div><form id="mail-config-form" class="email-config-form"><div class="form-grid two-col">${field("GMAIL SENDER ADDRESS *", "gmailAddress", "email", { required: true, value: data.settings.gmailAddress, placeholder: "reports@gmail.com" })}${field("GOOGLE APP PASSWORD *", "appPassword", "password", { required: true, maxlength: 32, autocomplete: "new-password", placeholder: "16-character App Password" })}</div><div class="email-safety"><strong>⚿ Password is memory-only</strong><p>The app password is never written to the database. It is cleared when the local server exits; enter it again after restarting. Use a Google App Password, not your main Google password.</p></div><button class="button primary" type="submit">Save Gmail sender</button><span class="configured-badge ${data.settings.appPasswordConfigured ? "ready" : ""}">${data.settings.appPasswordConfigured ? "Ready for this session" : "Not configured this session"}</span></form></section>`;
   } else if (state.adminSection === "Appearance") {
-    content = `<section class="card admin-card appearance-card"><div class="panel-heading"><div><span class="section-label">WORKSPACE DESIGN</span><h2>Appearance</h2><p>Set the shared surface style, typography, accent color and readable text size.</p></div><span class="count-chip">Applies to all users</span></div><form id="appearance-form" class="stack-form"><div class="form-grid two-col">${field("SURFACE STYLE", "style", "text", { required: true, select: [{ value: "glass", label: "Soft glass" }, { value: "classic", label: "Classic solid" }], value: data.settings.appearanceStyle || "glass" })}${field("TYPOGRAPHY", "fontFamily", "text", { required: true, select: [{ value: "inter", label: "Inter" }, { value: "manrope", label: "Manrope" }], value: data.settings.appearanceFont || "inter" })}${field("ACCENT COLOR", "accent", "text", { required: true, select: [{ value: "teal", label: "Capitol teal" }, { value: "blue", label: "Blue" }, { value: "violet", label: "Violet" }, { value: "orange", label: "Warm orange" }], value: data.settings.appearanceAccent || "teal" })}${field("TEXT SIZE", "textSize", "text", { required: true, select: [{ value: "normal", label: "Standard" }, { value: "large", label: "Large" }], value: data.settings.appearanceTextSize || "normal" })}</div><div class="appearance-preview"><span class="appearance-preview-dot"></span><span><strong>Shared workspace style</strong><small>Settings apply to dashboards, tables, forms and notifications after saving.</small></span><button type="submit" class="button primary">Save appearance</button></div></form></section>`;
+    content = renderAppearanceSettings(data.settings);
   } else if (state.adminSection === "Locations") {
     const locations = data.locations.map(location => `<tr><td><input class="inline-edit" data-location-name="${location.id}" value="${esc(location.name)}" aria-label="Store name"></td><td><select class="user-active" data-location-active="${location.id}"><option value="true" ${location.active ? "selected" : ""}>Enabled</option><option value="false" ${!location.active ? "selected" : ""}>Deleted</option></select></td><td><div class="admin-row-actions"><button class="button small secondary" data-action="save-location" data-id="${location.id}">Save</button><button class="button small danger" data-action="delete-location" data-id="${location.id}" ${!location.active ? "disabled" : ""}>Delete</button></div></td></tr>`).join("");
     content = `<div class="admin-grid"><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">STOCK LOCATIONS</span><h2>Stores</h2><p>Edit store names or delete stores. Reassign active items and clear stock before deleting a store.</p></div></div><div class="table-scroll"><table class="data-table"><thead><tr><th>STORE</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>${locations}</tbody></table></div></section><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">EXPAND YOUR STORES</span><h2>Add store</h2></div></div><form id="location-form" class="stack-form">${field("STORE NAME *", "name", "text", { required: true, minlength: 2, maxlength: 80, placeholder: "e.g. Annex Store" })}<button type="submit" class="button primary">Add store</button></form></section></div>`;
   } else if (state.adminSection === "Clear All") {
-    content = `<section class="card admin-card reset-card"><div class="panel-heading"><div><span class="section-label">DESTRUCTIVE ADMIN ACTION</span><h2>Clear all system data</h2><p>This permanently removes inventory items, stock batches and movements, water records, custom inventory columns and values, custom stores/categories, requesters and historical audit entries. All user accounts remain.</p></div><span class="reset-warning">!</span></div><div class="reset-details"><strong>What remains</strong><p>The app's five standard stores, default categories and standard requester lists are restored so the system can be used again. Custom Gmail settings are cleared, and the reset itself is recorded in the audit log.</p></div><button type="button" class="button danger" data-action="clear-all">Clear All</button></section>`;
+    content = `<section class="card admin-card reset-card"><div class="panel-heading"><div><span class="section-label">DESTRUCTIVE ADMIN ACTION</span><h2>Clear all system data</h2><p>This permanently removes inventory items, stock batches and movements, water records, monthly inventory archives, custom inventory columns and values, custom stores/categories, requesters and historical audit entries. All user accounts remain.</p></div><span class="reset-warning">!</span></div><div class="reset-details"><strong>What remains</strong><p>The app's standard stores, default categories and standard requester lists are restored so the system can be used again. Custom Gmail settings are cleared, and the reset itself is recorded in the audit log.</p></div><button type="button" class="button danger" data-action="clear-all">Clear All</button></section>`;
   } else {
     const auditRows = data.audit.map(entry => `<tr><td>${prettyDateTime(entry.created_at)}</td><td>${esc(entry.actor_name)}</td><td>${esc(entry.action)}</td><td>${esc(entry.detail)}</td></tr>`).join("");
     content = `<section class="card admin-card"><div class="panel-heading"><div><span class="section-label">SECURITY &amp; CHANGE HISTORY</span><h2>Administrative audit log</h2><p>Recent account, stock, and configuration actions.</p></div></div><div class="table-scroll"><table class="data-table"><thead><tr><th>TIME</th><th>ACTOR</th><th>ACTION</th><th>DETAIL</th></tr></thead><tbody>${auditRows || `<tr><td colspan="4">No admin events yet.</td></tr>`}</tbody></table></div></section>`;
@@ -688,6 +884,10 @@ function render(pageContent) {
 }
 
 async function navigate(page) {
+  if (state.page === "Admin" && page !== "Admin" && state.appearanceDraft) {
+    state.appearanceDraft = null;
+    applyAppearance();
+  }
   state.page = page;
   state.report = null;
   render(`<div class="loading-content"><span class="spinner"></span> Loading ${esc(page.toLowerCase())}…</div>`);
@@ -697,6 +897,7 @@ async function navigate(page) {
     } else if (page === "Inventory") {
       state.inventorySection = "active";
       state.inventory = await api("/api/inventory");
+      state.inventoryArchives = (await api("/api/inventory/archives")).archives;
       state.bootstrap.inventoryColumns = state.inventory.inventoryColumns || [];
       if (state.bootstrap.user.role === "admin") {
         state.archivedItems = (await api("/api/admin/archived-items")).items;
@@ -742,9 +943,35 @@ async function navigate(page) {
       state.auditor = await api("/api/auditor");
       render(renderAuditor(state.auditor));
     }
+    return true;
   } catch (error) {
     render(`<div class="error-state"><strong>Could not load ${esc(page.toLowerCase())}</strong><p>${esc(error.message)}</p><button class="button primary" data-action="retry">Try again</button></div>`);
+    return false;
   }
+}
+
+async function refreshCurrentPage() {
+  const inventorySection = state.inventorySection;
+  const refreshed = await api("/api/bootstrap");
+  state.bootstrap = { ...state.bootstrap, ...refreshed };
+  state.appearanceDraft = null;
+  applyAppearance();
+  if (!state.bootstrap.user) {
+    showLogin();
+    return true;
+  }
+  const loaded = await navigate(state.page);
+  if (loaded && state.page === "Inventory" && inventorySection === "archive") {
+    try {
+      state.archivedItems = (await api("/api/admin/archived-items")).items;
+      state.inventorySection = "archive";
+      render(renderInventory(state.inventory));
+    } catch (error) {
+      render(`<div class="error-state"><strong>Could not refresh inventory archives</strong><p>${esc(error.message)}</p><button class="button primary" data-action="retry">Try again</button></div>`);
+      return false;
+    }
+  }
+  return loaded;
 }
 
 function showSetup() {
@@ -757,8 +984,11 @@ function showLogin() {
 }
 
 async function initialize() {
+  startConnectionMonitor();
   try {
     state.bootstrap = await api("/api/bootstrap");
+    state.appearanceDraft = null;
+    applyAppearance();
     if (state.bootstrap.setupRequired) showSetup();
     else if (!state.bootstrap.user) showLogin();
     else await navigate("Dashboard");
@@ -769,6 +999,71 @@ async function initialize() {
 
 function formValues(form) {
   return Object.fromEntries(new FormData(form).entries());
+}
+
+function appearanceFromForm(form) {
+  const themes = {};
+  for (const theme of ["light", "dark"]) {
+    themes[theme] = Object.fromEntries(APPEARANCE_COLOR_FIELDS.map(([fieldName]) => [
+      fieldName,
+      form.elements.namedItem(`${theme}${fieldName[0].toUpperCase()}${fieldName.slice(1)}`).value,
+    ]));
+  }
+  return {
+    fontFamily: form.elements.fontFamily.value,
+    fontWeight: form.elements.fontWeight.value,
+    fontScale: Number(form.elements.fontScale.value),
+    style: form.elements.style.value,
+    themes,
+  };
+}
+
+function updateAppearancePreview() {
+  const form = document.querySelector("#appearance-form");
+  if (!form) return;
+  const appearance = appearanceFromForm(form);
+  state.appearanceDraft = appearance;
+  applyAppearance();
+  form.querySelector("#font-scale-value").textContent =
+    `${textScaleLabel(appearance.fontScale)} · ${Math.round(appearance.fontScale * 100)}%`;
+  for (const preview of form.querySelectorAll("[data-appearance-preview]")) {
+    const colors = appearance.themes[preview.dataset.appearancePreview];
+    for (const [field, value] of Object.entries(colors)) {
+      preview.style.setProperty(`--preview-${field}`, value);
+      const inputName = `${preview.dataset.appearancePreview}${field[0].toUpperCase()}${field.slice(1)}`;
+      const output = form.elements.namedItem(inputName)?.closest(".appearance-color-field")?.querySelector("output");
+      if (output) output.textContent = value;
+    }
+    preview.style.setProperty("--preview-font", `"${APPEARANCE_FONTS[appearance.fontFamily]}", sans-serif`);
+    preview.style.setProperty("--preview-scale", String(appearance.fontScale));
+    preview.style.setProperty("--preview-weight", appearance.fontWeight);
+  }
+  updatePretextPreview(form);
+}
+
+async function updatePretextPreview(form) {
+  const preview = form.querySelector(".appearance-preview-copy");
+  const resultElement = form.querySelector("#pretext-layout-result");
+  if (!preview || !resultElement) return;
+  await pretextReady;
+  if (!preview.isConnected) return;
+  if (!pretextLayout) {
+    resultElement.textContent = "Text layout preview is unavailable; browser text styling still works.";
+    return;
+  }
+  try {
+    const style = getComputedStyle(preview);
+    const width = Math.max(1, preview.clientWidth);
+    const fontSize = parseFloat(style.fontSize);
+    const lineHeight = parseFloat(style.lineHeight) || fontSize * 1.5;
+    const font = `${style.fontWeight} ${fontSize}px "${APPEARANCE_FONTS[currentAppearance().fontFamily]}"`;
+    const prepared = pretextLayout.prepare(preview.textContent, font);
+    const layout = pretextLayout.layout(prepared, width, lineHeight);
+    resultElement.textContent = `Pretext predicts ${layout.lineCount} ${layout.lineCount === 1 ? "line" : "lines"} at this width and text size.`;
+  } catch (error) {
+    console.error("Pretext could not measure the typography preview:", error);
+    resultElement.textContent = "Text layout preview could not be measured.";
+  }
 }
 
 function setLoading(button, loading, text = "Working…") {
@@ -875,6 +1170,21 @@ document.addEventListener("click", async event => {
     if (event.target.classList?.contains("modal-backdrop")) closeModal();
     return;
   }
+  if (target.dataset.inventoryArchive) {
+    state.openInventoryArchive = state.openInventoryArchive === target.dataset.inventoryArchive
+      ? ""
+      : target.dataset.inventoryArchive;
+    state.openArchiveStore = "";
+    render(renderInventory(state.inventory));
+    return;
+  }
+  if (target.dataset.archiveStore) {
+    state.openArchiveStore = state.openArchiveStore === target.dataset.archiveStore
+      ? ""
+      : target.dataset.archiveStore;
+    render(renderInventory(state.inventory));
+    return;
+  }
   if (target.dataset.storeToggle) {
     state.openStore = state.openStore === target.dataset.storeToggle ? "" : target.dataset.storeToggle;
     render(renderInventory(state.inventory));
@@ -903,6 +1213,10 @@ document.addEventListener("click", async event => {
     return;
   }
   if (target.dataset.adminSection) {
+    if (state.adminSection === "Appearance" && target.dataset.adminSection !== "Appearance") {
+      state.appearanceDraft = null;
+      applyAppearance();
+    }
     state.adminSection = target.dataset.adminSection;
     await withButtonLoading(target, "Loading…", reloadAdmin);
     return;
@@ -939,12 +1253,22 @@ document.addEventListener("click", async event => {
       showLogin();
     } catch (error) { toast(error.message, true); }
     finally { if (target.isConnected) setLoading(target, false); }
+  } else if (target.dataset.action === "refresh") {
+    await withButtonLoading(target, "Refreshing…", async () => {
+      if (await refreshCurrentPage()) toast("Current section refreshed.");
+    });
   } else if (target.dataset.action === "retry" || target.dataset.action === "initialize") {
     await initialize();
   } else if (target.dataset.action === "toggle-theme") {
+    const appearanceForm = state.page === "Admin" && state.adminSection === "Appearance"
+      ? document.querySelector("#appearance-form")
+      : null;
+    if (appearanceForm) state.appearanceDraft = appearanceFromForm(appearanceForm);
     state.theme = state.theme === "dark" ? "light" : "dark";
     localStorage.setItem("capitol-theme", state.theme);
-    const pageContent = document.querySelector("#page-content")?.innerHTML || "";
+    const pageContent = appearanceForm
+      ? renderAdmin(state.admin)
+      : document.querySelector("#page-content")?.innerHTML || "";
     shell(pageContent);
   } else if (target.dataset.action === "go-issue") {
     await navigate("Stock issue");
@@ -1294,7 +1618,9 @@ function collectReportFormData(form) {
 }
 
 document.addEventListener("change", async event => {
-  if (event.target.matches('#stock-issue-form [name="department"]')) {
+  if (event.target.closest("#appearance-form")) {
+    updateAppearancePreview();
+  } else if (event.target.matches('#stock-issue-form [name="department"]')) {
     const department = event.target.value;
     document.querySelector("#department-fields").innerHTML = renderDepartmentFields(department);
     updateIssueSummary();
@@ -1310,9 +1636,9 @@ document.addEventListener("change", async event => {
         if (!locationSelect.isConnected || locationSelect.value !== selectedLocationId) return;
         state.issueItems = stock.items;
         itemSelect.innerHTML = itemSelectOptions(selectedLocationId)
-          .map(option => `<option value="${esc(option.value)}">${esc(option.label)}</option>`)
+          .map(option => `<option value="${esc(option.value)}" ${option.disabled ? "disabled" : ""}>${esc(option.label)}</option>`)
           .join("");
-        if (!state.issueItems.length) toast("No available items in this store.", true);
+        if (!state.issueItems.length) toast("No active catalog items are listed for this store.", true);
       } catch (error) {
         if (!locationSelect.isConnected || locationSelect.value !== selectedLocationId) return;
         state.issueItems = [];
@@ -1341,7 +1667,9 @@ document.addEventListener("change", async event => {
 });
 
 document.addEventListener("input", event => {
-  if (event.target.id === "inventory-search" || event.target.id === "inventory-category") {
+  if (event.target.closest("#appearance-form")) {
+    updateAppearancePreview();
+  } else if (event.target.id === "inventory-search" || event.target.id === "inventory-category") {
     if (state.page !== "Inventory") return;
     if (state.inventorySection === "archive") {
       render(renderInventory(state.inventory));
@@ -1635,9 +1963,14 @@ document.addEventListener("submit", async event => {
     const submit = form.querySelector('[type="submit"]');
     setLoading(submit, true, "Saving appearance…");
     try {
-      const result = await api("/api/admin/appearance", { method: "PUT", body: formValues(form) });
+      const result = await api("/api/admin/appearance", {
+        method: "PUT",
+        body: { ...formValues(form), fontScale: Number(form.elements.fontScale.value) },
+      });
       state.bootstrap.appearance = result.appearance;
-      toast("Shared appearance settings saved.");
+      state.appearanceDraft = null;
+      applyAppearance();
+      toast("Typography and light/dark colors are saved for everyone.");
       render(renderAdmin(await api("/api/admin")));
     } catch (error) { toast(error.message, true); }
     finally { if (submit.isConnected) setLoading(submit, false); }

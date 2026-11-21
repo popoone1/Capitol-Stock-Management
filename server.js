@@ -17,7 +17,34 @@ const HOST = usePostgres ? "0.0.0.0" : "127.0.0.1";
 const SESSION_COOKIE = "capitol_session";
 const SESSION_MS = 8 * 60 * 60 * 1000;
 const DEFAULT_CATEGORIES = ["Dry", "Chemical", "Protein", "Fruit", "Vegetable", "Other"];
-const DEFAULT_STORES = ["Dry Store", "Chemical Store", "Protein Store", "Fruit Store", "Vegetable Store"];
+const DEFAULT_STORES = ["Dry Store", "Chemical Store", "Protein Store", "Fruit Store", "Vegetable Store", "Frozen Store"];
+const APPEARANCE_FONTS = {
+  inter: "Inter",
+  manrope: "Manrope",
+  "dm-sans": "DM Sans",
+  roboto: "Roboto",
+  lato: "Lato",
+  "source-sans-3": "Source Sans 3",
+  "nunito-sans": "Nunito Sans",
+  "ibm-plex-sans": "IBM Plex Sans",
+  merriweather: "Merriweather",
+  lora: "Lora",
+  "atkinson-hyperlegible": "Atkinson Hyperlegible",
+};
+const APPEARANCE_COLOR_DEFAULTS = {
+  light: {
+    text: "#000000", muted: "#000000", heading: "#000000",
+    background: "#f4f7fb", surface: "#ffffff", border: "#d8e0e9",
+    accent: "#168b78", accentStrong: "#116a5d",
+  },
+  dark: {
+    text: "#ffffff", muted: "#ffffff", heading: "#ffffff",
+    background: "#0b1220", surface: "#141e2e", border: "#334155",
+    accent: "#4ad6b5", accentStrong: "#178f7c",
+  },
+};
+const APPEARANCE_COLOR_FIELDS = ["text", "muted", "heading", "background", "surface", "border", "accent", "accentStrong"];
+const APPEARANCE_FONT_WEIGHTS = ["400", "500", "600", "700", "800"];
 const LEGACY_STORE_NAMES = new Map([
   ["Main Store", "Protein Store"],
   ["Kitchen Store", "Fruit Store"],
@@ -348,6 +375,29 @@ if (!db.prepare("SELECT 1 FROM settings WHERE key = 'inventory_store_migration_v
 }
 }
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS inventory_month_archives (
+    month TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )
+`);
+if (usePostgres) {
+  db.exec("ALTER TABLE inventory_month_archives ENABLE ROW LEVEL SECURITY");
+  db.exec("REVOKE ALL ON TABLE inventory_month_archives FROM anon, authenticated");
+}
+
+if (!db.prepare("SELECT 1 FROM settings WHERE key = 'inventory_store_migration_v3'").get()) {
+  transaction(() => {
+    for (const name of DEFAULT_STORES) {
+      db.prepare("INSERT INTO locations (id, name) VALUES (?, ?) ON CONFLICT DO NOTHING")
+        .run(crypto.randomUUID(), name);
+      db.prepare("UPDATE locations SET active = 1 WHERE name = ? COLLATE NOCASE").run(name);
+    }
+    db.prepare("INSERT INTO settings (key, value) VALUES ('inventory_store_migration_v3', '1')").run();
+  });
+}
+
 const sessions = new Map();
 const loginAttempts = new Map();
 let gmailAppPassword = "";
@@ -598,6 +648,25 @@ function getSettings() {
   return Object.fromEntries(rows.map(row => [row.key, row.value]));
 }
 
+function getAppearanceSettings(settings = getSettings()) {
+  const savedWeight = settings.appearanceWeight || "700";
+  const fontWeight = savedWeight === "bold" ? "700" : savedWeight === "normal" ? "500" : savedWeight;
+  const savedScale = Number(settings.appearanceFontScale || 1);
+  return {
+    fontFamily: Object.hasOwn(APPEARANCE_FONTS, settings.appearanceFont) ? settings.appearanceFont : "inter",
+    fontWeight: APPEARANCE_FONT_WEIGHTS.includes(fontWeight) ? fontWeight : "700",
+    fontScale: Number.isFinite(savedScale) && savedScale >= 0.75 && savedScale <= 1.75 ? savedScale : 1,
+    style: settings.appearanceStyle === "classic" ? "classic" : "glass",
+    themes: Object.fromEntries(Object.entries(APPEARANCE_COLOR_DEFAULTS).map(([theme, defaults]) => [
+      theme,
+      Object.fromEntries(APPEARANCE_COLOR_FIELDS.map(field => {
+        const value = settings[`appearance_${theme}_${field}`];
+        return [field, /^#[0-9a-f]{6}$/i.test(value || "") ? value : defaults[field]];
+      })),
+    ])),
+  };
+}
+
 function getInventoryColumns(includeInactive = false) {
   return db.prepare(`
     SELECT id, name, active
@@ -705,6 +774,103 @@ function previousMonthStock(itemId) {
   return Number(row.quantity);
 }
 
+function previousMonthKey(month) {
+  const [year, number] = month.split("-").map(Number);
+  return number === 1 ? `${year - 1}-12` : `${year}-${String(number - 1).padStart(2, "0")}`;
+}
+
+function inventoryMonthArchive(month) {
+  const row = db.prepare("SELECT payload, created_at FROM inventory_month_archives WHERE month = ?").get(month);
+  return row ? { ...JSON.parse(row.payload), created_at: row.created_at } : null;
+}
+
+function buildInventoryMonthArchive(month) {
+  const monthStart = `${month}-01`;
+  const [year, monthNumber] = month.split("-").map(Number);
+  const monthEnd = new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
+  const metrics = db.prepare(`
+    SELECT item_id,
+      COALESCE(SUM(CASE WHEN request_date < ? THEN quantity ELSE 0 END), 0) AS previous_month_quantity,
+      COALESCE(SUM(CASE WHEN request_date >= ? AND request_date <= ? AND quantity > 0 THEN quantity ELSE 0 END), 0) AS received_stock_quantity,
+      COALESCE(SUM(CASE WHEN request_date >= ? AND request_date <= ? AND quantity < 0 THEN -quantity ELSE 0 END), 0) AS removed
+    FROM stock_transactions
+    WHERE voided_at IS NULL AND reversal_of IS NULL AND request_date <= ?
+    GROUP BY item_id
+  `).all(monthStart, monthStart, monthEnd, monthStart, monthEnd, monthEnd);
+  const metricsByItem = new Map(metrics.map(row => [row.item_id, row]));
+  const columns = getInventoryColumns();
+  const customValues = new Map();
+  for (const value of db.prepare(`
+    SELECT item_id, column_id, value
+    FROM inventory_column_values
+    WHERE column_id IN (SELECT id FROM inventory_columns WHERE active = 1)
+  `).all()) {
+    const values = customValues.get(value.item_id) || {};
+    values[value.column_id] = value.value;
+    customValues.set(value.item_id, values);
+  }
+  const items = db.prepare(`
+    SELECT id, sku, name, category, store, unit, active
+    FROM items
+    ORDER BY name COLLATE NOCASE
+  `).all().map(item => {
+    const row = metricsByItem.get(item.id);
+    const previousMonthQuantity = Number(row?.previous_month_quantity || 0);
+    const receivedStockQuantity = Number(row?.received_stock_quantity || 0);
+    const removed = Number(row?.removed || 0);
+    const currentQuantity = previousMonthQuantity + receivedStockQuantity;
+    const remainder = Math.max(0, currentQuantity - removed);
+    const statusPercent = currentQuantity > 0 ? Math.min(100, remainder / currentQuantity * 100) : 0;
+    const statusColor = statusPercent >= 80 ? "good" :
+      statusPercent >= 20 && statusPercent <= 70 ? "warning" :
+        statusPercent <= 10 ? "danger" : "neutral";
+    return {
+      ...item,
+      active: Boolean(item.active),
+      previous_month_quantity: previousMonthQuantity,
+      received_stock_quantity: receivedStockQuantity,
+      current_quantity: currentQuantity,
+      removed,
+      remainder,
+      status_percent: statusPercent,
+      status_color: statusColor,
+      custom_values: customValues.get(item.id) || {},
+    };
+  });
+  const stores = new Set(db.prepare("SELECT name FROM locations").all().map(row => row.name));
+  for (const item of items) if (item.store) stores.add(item.store);
+  for (const row of db.prepare(`
+    SELECT DISTINCT location_name AS name
+    FROM stock_transactions
+    WHERE request_date >= ? AND request_date <= ?
+  `).all(monthStart, monthEnd)) {
+    if (row.name) stores.add(row.name);
+  }
+  return {
+    month,
+    stores: [...stores].sort((first, second) => first.localeCompare(second)),
+    inventoryColumns: columns,
+    items,
+  };
+}
+
+function ensurePreviousMonthInventoryArchive() {
+  const currentMonth = todayKey().slice(0, 7);
+  const month = previousMonthKey(currentMonth);
+  if (db.prepare("SELECT 1 FROM inventory_month_archives WHERE month = ?").get(month)) return;
+  const payload = buildInventoryMonthArchive(month);
+  db.prepare(`
+    INSERT INTO inventory_month_archives (month, payload, created_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(month) DO NOTHING
+  `).run(month, JSON.stringify(payload), nowIso());
+}
+
+function listInventoryArchives() {
+  return db.prepare("SELECT month, payload, created_at FROM inventory_month_archives ORDER BY month DESC")
+    .all().map(row => ({ ...JSON.parse(row.payload), created_at: row.created_at }));
+}
+
 function stockItems({ includeInactive = false, search = "", category = "", locationId = "", store = "" } = {}) {
   const items = db.prepare(`
     SELECT i.id, i.sku, i.name, i.category, i.store, i.unit, i.reorder_level, i.active, i.created_at, i.updated_at,
@@ -736,6 +902,8 @@ function stockItems({ includeInactive = false, search = "", category = "", locat
     GROUP BY item_id
   `).all(monthStart, monthStart, today, monthStart, today);
   const metricsByItem = new Map(metrics.map(row => [row.item_id, row]));
+  const previousArchive = inventoryMonthArchive(previousMonthKey(today.slice(0, 7)));
+  const archivedItemBalances = new Map((previousArchive?.items || []).map(item => [item.id, Number(item.remainder)]));
   const customValues = new Map();
   for (const value of db.prepare(`
     SELECT item_id, column_id, value
@@ -750,7 +918,9 @@ function stockItems({ includeInactive = false, search = "", category = "", locat
     const quantity = Number(row.on_hand);
     const threshold = Number(row.reorder_level);
     const itemMetrics = metricsByItem.get(row.id);
-    const previousMonthQuantity = Number(itemMetrics?.previous_month_quantity || 0);
+    const previousMonthQuantity = archivedItemBalances.has(row.id)
+      ? archivedItemBalances.get(row.id)
+      : Number(itemMetrics?.previous_month_quantity || 0);
     const currentQuantity = previousMonthQuantity + Number(itemMetrics?.current_month_additions || 0);
     const removed = Number(itemMetrics?.removed || 0);
     const remainder = Math.max(0, currentQuantity - removed);
@@ -2070,10 +2240,7 @@ function adminOverview() {
     settings: {
       gmailAddress: settings.gmailAddress || "",
       appPasswordConfigured: Boolean(gmailAppPassword && mailerAddress),
-      appearanceAccent: settings.appearanceAccent || "teal",
-      appearanceTextSize: settings.appearanceTextSize || "normal",
-      appearanceStyle: settings.appearanceStyle || "glass",
-      appearanceFont: settings.appearanceFont || "inter",
+      appearance: getAppearanceSettings(settings),
     },
     audit: db.prepare("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 100").all(),
   };
@@ -2084,6 +2251,7 @@ function resetSystemData(actor) {
     movements: Number(db.prepare("SELECT COUNT(*) AS count FROM stock_transactions").get().count),
     items: Number(db.prepare("SELECT COUNT(*) AS count FROM items").get().count),
     batches: Number(db.prepare("SELECT COUNT(*) AS count FROM batches").get().count),
+    inventoryArchives: Number(db.prepare("SELECT COUNT(*) AS count FROM inventory_month_archives").get().count),
     waterRecords: Number(db.prepare("SELECT COUNT(*) AS count FROM water_records").get().count),
     requesters: Number(db.prepare("SELECT COUNT(*) AS count FROM requesters").get().count),
     users: Number(db.prepare("SELECT COUNT(*) AS count FROM users").get().count),
@@ -2093,6 +2261,7 @@ function resetSystemData(actor) {
       DELETE FROM stock_transactions;
       DELETE FROM batches;
       DELETE FROM items;
+      DELETE FROM inventory_month_archives;
       DELETE FROM inventory_columns;
       DELETE FROM water_records;
       DELETE FROM requesters;
@@ -2157,12 +2326,7 @@ function publicBootstrap(request) {
     waterStaff: WATER_STAFF,
     waterRooms: WATER_ROOMS,
     waterRequesters: getWaterRequesters(),
-    appearance: {
-      accent: getSettings().appearanceAccent || "teal",
-      textSize: getSettings().appearanceTextSize || "normal",
-      style: getSettings().appearanceStyle || "glass",
-      fontFamily: getSettings().appearanceFont || "inter",
-    },
+    appearance: getAppearanceSettings(),
     user: null,
     csrfToken: null,
     gmailConfigured: Boolean(gmailAppPassword && mailerAddress),
@@ -2215,7 +2379,10 @@ function route(method, pathname, handler) {
   routes.set(`${method} ${pathname}`, asyncRoute(handler));
 }
 
-route("GET", "/api/bootstrap", request => publicBootstrap(request));
+route("GET", "/api/bootstrap", request => {
+  ensurePreviousMonthInventoryArchive();
+  return publicBootstrap(request);
+});
 route("POST", "/api/setup", (_request, _response, body) => {
   if (db.prepare("SELECT 1 AS found FROM users LIMIT 1").get()) throw httpError(409, "Initial setup is already complete. Sign in instead.");
   const username = String(body.username || "").trim();
@@ -2324,6 +2491,11 @@ route("GET", "/api/inventory", (request, _response, _body, session) => {
     locationId: url.searchParams.get("locationId") || "",
   }), locations: getLocations(), inventoryColumns: getInventoryColumns() };
 });
+route("GET", "/api/inventory/archives", request => {
+  requireSession(request);
+  ensurePreviousMonthInventoryArchive();
+  return { archives: listInventoryArchives() };
+});
 route("GET", "/api/admin/archived-items", request => {
   requireAdmin(request);
   return { items: stockItems({ includeInactive: true }).filter(item => !item.active) };
@@ -2392,8 +2564,10 @@ route("GET", "/api/requests", request => {
     WHERE t.quantity < 0 AND t.kind IN ('requisition', 'issue')
       AND t.voided_at IS NULL AND t.reversal_of IS NULL
       AND (? = '' OR (l.active = 1 AND l.name = ?))
-    GROUP BY COALESCE(t.request_group_id, t.id)
-    ORDER BY t.request_date DESC, t.created_at DESC, t.item_name COLLATE NOCASE
+    GROUP BY COALESCE(t.request_group_id, t.id), t.request_group_id, t.item_id,
+      t.request_date, t.item_sku, t.item_name, t.unit, t.department, t.person, t.area,
+      t.issued_by, t.kind, t.created_by, COALESCE(l.name, t.location_name)
+    ORDER BY t.request_date DESC, MAX(t.created_at) DESC, t.item_name COLLATE NOCASE
   `).all(store, store);
   return { rows, count: rows.length };
 });
@@ -2645,33 +2819,48 @@ route("POST", "/api/admin/mail", (request, response, body) => {
 });
 route("PUT", "/api/admin/appearance", (request, _response, body) => {
   const admin = requireAdmin(request, true);
-  const accent = String(body.accent || "");
-  const textSize = String(body.textSize || "");
   const style = String(body.style || "");
   const fontFamily = String(body.fontFamily || "");
-  if (!["teal", "blue", "violet", "orange"].includes(accent)) {
-    throw httpError(400, "Choose one of the available accent colors.");
-  }
-  if (!["normal", "large"].includes(textSize)) {
-    throw httpError(400, "Choose a valid interface text size.");
-  }
+  const fontWeight = String(body.fontWeight || "");
+  const fontScale = Number(body.fontScale);
   if (!["glass", "classic"].includes(style)) {
     throw httpError(400, "Choose a valid interface style.");
   }
-  if (!["inter", "manrope"].includes(fontFamily)) {
-    throw httpError(400, "Choose a valid local font.");
+  if (!Object.hasOwn(APPEARANCE_FONTS, fontFamily)) {
+    throw httpError(400, "Choose a supported typography option.");
+  }
+  if (!APPEARANCE_FONT_WEIGHTS.includes(fontWeight)) {
+    throw httpError(400, "Choose a valid interface font weight.");
+  }
+  if (!Number.isFinite(fontScale) || fontScale < 0.75 || fontScale > 1.75) {
+    throw httpError(400, "Text size must be between 75% and 175%.");
+  }
+  const themes = {};
+  for (const theme of Object.keys(APPEARANCE_COLOR_DEFAULTS)) {
+    themes[theme] = {};
+    for (const field of APPEARANCE_COLOR_FIELDS) {
+      const value = String(body[`${theme}${field[0].toUpperCase()}${field.slice(1)}`] || "");
+      if (!/^#[0-9a-f]{6}$/i.test(value)) {
+        throw httpError(400, `Choose a valid ${theme} theme ${field} color.`);
+      }
+      themes[theme][field] = value.toLowerCase();
+    }
   }
   const actor = db.prepare("SELECT * FROM users WHERE id = ?").get(admin.userId);
-  db.prepare("INSERT INTO settings (key, value) VALUES ('appearanceAccent', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-    .run(accent);
-  db.prepare("INSERT INTO settings (key, value) VALUES ('appearanceTextSize', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-    .run(textSize);
-  db.prepare("INSERT INTO settings (key, value) VALUES ('appearanceStyle', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-    .run(style);
-  db.prepare("INSERT INTO settings (key, value) VALUES ('appearanceFont', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-    .run(fontFamily);
-  addAudit(actor, "settings.appearance", `Updated appearance: ${style} style, ${accent} accent, ${fontFamily} font, ${textSize} text.`);
-  return { appearance: { accent, textSize, style, fontFamily } };
+  transaction(() => {
+    const saveSetting = db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    saveSetting.run("appearanceStyle", style);
+    saveSetting.run("appearanceFont", fontFamily);
+    saveSetting.run("appearanceWeight", fontWeight);
+    saveSetting.run("appearanceFontScale", String(fontScale));
+    for (const [theme, colors] of Object.entries(themes)) {
+      for (const [field, value] of Object.entries(colors)) {
+        saveSetting.run(`appearance_${theme}_${field}`, value);
+      }
+    }
+    addAudit(actor, "settings.appearance", `Updated shared typography, ${fontScale}x text size, and light/dark theme colors.`);
+  });
+  return { appearance: getAppearanceSettings() };
 });
 route("GET", "/api/admin/audit", request => {
   requireAdmin(request);
@@ -2718,23 +2907,27 @@ function serveStatic(request, response, pathname) {
     ["/vendor/bootstrap.bundle.min.js", path.join("node_modules", "bootstrap", "dist", "js", "bootstrap.bundle.min.js")],
   ]);
   const filename = allowed.get(pathname);
-  if (!filename) {
+  const pretextModule = /^\/vendor\/pretext\/((?:[a-z0-9_-]+\/)*[a-z0-9_-]+\.js)$/i.exec(pathname);
+  const pretextFile = pretextModule
+    ? path.join(ROOT, "node_modules", "@chenglou", "pretext", "dist", pretextModule[1])
+    : filename ? path.join(ROOT, filename) : null;
+  if (!pretextFile) {
     response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" }).end("Not found");
     return;
   }
-  fs.readFile(path.join(ROOT, filename), (error, contents) => {
+  fs.readFile(pretextFile, (error, contents) => {
     if (error) {
-      console.error(`Unable to read ${filename}:`, error.message);
+      console.error(`Unable to read ${pretextFile}:`, error.message);
       response.writeHead(500).end("The application could not be loaded.");
       return;
     }
     response.writeHead(200, {
-      "Content-Type": mimeTypes[path.extname(filename)],
+      "Content-Type": mimeTypes[path.extname(pretextFile)],
       "Cache-Control": "no-cache",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
       "Referrer-Policy": "no-referrer",
-      "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+      "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     });
     response.end(contents);
   });
@@ -2782,6 +2975,16 @@ server.on("error", error => {
 server.listen(PORT, HOST, () => {
   console.log(`Capitol Stock Management is ready on ${HOST}:${PORT}`);
   console.log(usePostgres ? "Connected to the hosted PostgreSQL database." : `Local SQLite database: ${DB_PATH}`);
+  const createPreviousMonthArchive = () => {
+    try {
+      ensurePreviousMonthInventoryArchive();
+    } catch (error) {
+      console.error("Monthly inventory archive could not be created:", error.message);
+    }
+  };
+  createPreviousMonthArchive();
+  const archiveTimer = setInterval(createPreviousMonthArchive, 60_000);
+  archiveTimer.unref();
 });
 
 function shutdown() {

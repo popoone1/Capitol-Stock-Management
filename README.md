@@ -1,6 +1,6 @@
 # Capitol Stock Management
 
-A local-first desktop inventory and requisition app for Capitol. It combines stock inventory, receiving, issuing, adjustments, department requisitions, expiry/spoilage entries, a persistent water tracker, user/admin access, reporting, CSV export and Gmail delivery.
+A cloud-ready inventory and requisition app for Capitol, with hosted PostgreSQL support and a standalone Windows desktop mode. It combines stock inventory, receiving, issuing, adjustments, department requisitions, expiry/spoilage entries, a persistent water tracker, user/admin access, reporting, CSV export and Gmail delivery.
 
 ## Requirements and first launch
 
@@ -26,7 +26,7 @@ The app can run in local SQLite mode or in cloud mode. Cloud mode uses the Supab
 
 To migrate the supplied local data and bring the API online:
 
-1. In the Supabase dashboard, open **SQL Editor** and run `supabase/migrations/20261120133000_initial_schema.sql`. The migration creates the app's tables, case-insensitive indexes, and row-level-security protections. Run it once in the new, empty project.
+1. In the Supabase dashboard, open **SQL Editor** and run `supabase/migrations/20261120133000_initial_schema.sql`, then `supabase/migrations/20261120143000_inventory_month_archives.sql`. These migrations create the app's tables, indexes, row-level-security protections and monthly inventory archive storage. Run them in order.
 2. Before deploying the API, import the existing local database. Open PowerShell and first change to the project folder. Paste the entire block below; when prompted, paste the complete PostgreSQL **Session pooler URI** and press Enter:
 
    ```powershell
@@ -58,19 +58,21 @@ The source migration and importer do not upload the SQLite snapshot automaticall
 
 Standard users can create department requisitions and water requests. Auditors can review inventory, stock movements (including voids and reversals), water history, and the audit log, but cannot change records. Admins can manage users, requesters, categories, stores, catalog items, water records, historical stock movements, shared appearance settings, and email settings. Stock movement corrections reconcile linked batches; voids keep the original entry and add a same-date compensating movement to preserve the historical audit trail. Stores are disabled rather than hard-deleted when they have history.
 
-Use the theme button in the top bar to switch between light and dark themes. The preference is saved in this browser on this PC. Administrators can choose a shared glass or classic surface, Inter or Manrope typography, accent color and standard or large text under **Admin → Appearance**. Bootstrap styles and scripts and the licensed font files are bundled locally, so the interface does not need a network connection.
+Use the refresh button in the top bar to reload the current section. The connection indicator checks the API and database and shows when the system is connected or unavailable. The theme button switches between light and dark themes; its preference is saved in this browser. Under **Admin → Appearance**, administrators can choose from 11 Google font families, font weight, and a live text-size slider from 75% to 175%. They can also customize body, secondary and heading text, backgrounds, surfaces, borders and gradient accents separately for each theme; saved choices apply to all users and the navigation. New workspaces default to black text in the light theme and white text in the dark theme. Pretext measures the live typography preview so its wrapping can be checked at the selected size. Core UI assets have local fallbacks; Google Fonts are loaded when internet access is available.
 
-The bundled Inter and Manrope font files are distributed under the SIL Open Font License; their license texts are in `assets/fonts`. Bootstrap is distributed under the MIT license; its license is included with the packaged Bootstrap files.
+The bundled Inter and Manrope font files are distributed under the SIL Open Font License; their license texts are in `assets/fonts`. Bootstrap and Pretext are distributed under the MIT license; their license files are included with the packaged dependencies.
 
 ## Stock operations
 
 - Create and edit the item catalog with SKU, category/store, unit, optional expiry date and low-stock threshold. Selecting a store automatically selects its matching category and stock location.
-- Inventory is grouped into Dry, Chemical, Protein, Fruit and Vegetable stores. Each store shows previous-month stock, stock received this month, current quantity (previous-month plus received), removed quantity, remainder and a color-coded remaining percentage. Issues and other stock-outs accumulate in Removed for the month.
+- Inventory is grouped into Dry, Chemical, Protein, Fruit, Vegetable and Frozen stores by default; administrators can manage additional locations. Each store shows previous-month stock, stock received this month, current quantity (previous-month plus received), removed quantity, remainder and a color-coded remaining percentage. Issues and other stock-outs accumulate in Removed for the month.
+- Inventory automatically saves a month-end snapshot and displays it as a collapsible monthly archive below the current stores. The latest completed month’s remainder seeds the current month’s previous-stock quantity. Render’s free service may sleep, so if it is asleep at midnight the snapshot is created when the service next starts or receives a request; exact midnight execution requires an always-on service or scheduled job.
 - Admins can add, rename, disable or delete custom inventory columns under Admin → Inventory columns. Custom values are collected when an item is added or edited and appear in inventory and store-specific Stock Updates Reports; required stock columns remain fixed.
 - Admins can add, rename or delete stores under Admin → Locations. Store changes are reflected in item assignments, issue locations and store-specific stock update reports; deletion is blocked until remaining stock and active item assignments are cleared.
 - The Requests page lists issued requisitions under All Stock Requests and each active store, combining stock drawn from multiple batches into one request line. Administrators can correct the issue date, quantity, requester or issuer; removal is recorded as an auditable reversal and updates inventory and reports.
 - Record receipts by quantity, supplier, purchase reference, unit cost, batch number and optional expiry. Inventory tracks received batches and uses earliest-expiring stock first when issuing.
 - Record department requisitions with lines from multiple stores in one submission. The app validates each line against stock at its selected location and will not issue negative inventory.
+- Out-of-stock items remain visible in the stock-issue item list but are disabled and cannot be selected.
 - Administrators can edit an item's previous-month opening quantity; corrections are recorded as auditable movements and cannot reduce stock below the amount already on hand.
 - Remove an item from the active inventory with its row action. Items with stock or movement history are archived to preserve their balance and audit trail; items with no history are deleted.
 - Admins can add or remove stock using a reasoned, auditable adjustment. Spoilage and expiry are recorded as their own stock-out movement types.
@@ -91,7 +93,7 @@ Generate all-store or store-specific requisition reports, stock-entry reports, a
 
 Gmail delivery needs an internet connection and a valid App Password. If mailing is not configured, report generation and local export still work.
 
-Administrators can use **Admin → Clear All** to reset inventory and other system records while retaining user accounts. The five default stores, default categories and standard requester lists are recreated, custom inventory columns and values are removed, custom Gmail settings are cleared, and the reset is recorded in the audit log. The action requires explicit typed confirmation.
+Administrators can use **Admin → Clear All** to reset inventory and other system records while retaining user accounts. Monthly inventory archives are cleared, the six default stores, default categories and standard requester lists are recreated, custom inventory columns and values are removed, custom Gmail settings are cleared, and the reset is recorded in the audit log. The action requires explicit typed confirmation.
 
 ## Database and privacy
 
