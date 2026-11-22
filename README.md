@@ -22,11 +22,11 @@ On first use, create the administrator in the setup screen. There is no default 
 
 ## Supabase cloud deployment
 
-The app can run in local SQLite mode or in cloud mode. Cloud mode uses the Supabase PostgreSQL database through the Node API in this repository; the desktop client never receives a database password or a Supabase service-role key. Render is configured as the free pilot API host in `render.yaml`. Its free web service can sleep while idle, so the first request after inactivity may take a little time to wake up.
+The app can run in local SQLite mode or in cloud mode. Cloud mode uses the Supabase PostgreSQL database through the Node API in this repository; the desktop client never receives a database password or a Supabase service-role key. Render is configured as the free pilot API host in `render.yaml`. Its free web service can sleep while idle, so the first request after inactivity may take a little time to wake up. The hosted app also includes an installable PWA shell for Android and iOS; authenticated API responses are never cached by its service worker.
 
 To migrate the supplied local data and bring the API online:
 
-1. In the Supabase dashboard, open **SQL Editor** and run `supabase/migrations/20261120133000_initial_schema.sql`, then `supabase/migrations/20261120143000_inventory_month_archives.sql`. These migrations create the app's tables, indexes, row-level-security protections and monthly inventory archive storage. Run them in order.
+1. In the Supabase dashboard, open **SQL Editor** and run `supabase/migrations/20261120133000_initial_schema.sql`, `supabase/migrations/20261120143000_inventory_month_archives.sql`, then `supabase/migrations/20261121100000_requests_month_archives.sql`. These migrations create the app's tables, indexes, row-level-security protections and monthly archive storage. Run them in order.
 2. Before deploying the API, import the existing local database. Open PowerShell and first change to the project folder. Paste the entire block below; when prompted, paste the complete PostgreSQL **Session pooler URI** and press Enter:
 
    ```powershell
@@ -67,12 +67,14 @@ The bundled Inter and Manrope font files are distributed under the SIL Open Font
 - Create and edit the item catalog with SKU, category/store, unit, optional expiry date and low-stock threshold. Selecting a store automatically selects its matching category and stock location.
 - Inventory is grouped into Dry, Chemical, Protein, Fruit, Vegetable and Frozen stores by default; administrators can manage additional locations. Each store shows previous-month stock, stock received this month, current quantity (previous-month plus received), removed quantity, remainder and a color-coded remaining percentage. Issues and other stock-outs accumulate in Removed for the month.
 - Inventory automatically saves a month-end snapshot and displays it as a collapsible monthly archive below the current stores. The latest completed month’s remainder seeds the current month’s previous-stock quantity. Render’s free service may sleep, so if it is asleep at midnight the snapshot is created when the service next starts or receives a request; exact midnight execution requires an always-on service or scheduled job.
+- Requests show the current month's store-by-store issue records and save completed months as collapsible archives, including empty stores. As with inventory, a sleeping free host creates the prior-month archive when it next starts or receives a request rather than exactly at midnight.
 - Admins can add, rename, disable or delete custom inventory columns under Admin → Inventory columns. Custom values are collected when an item is added or edited and appear in inventory and store-specific Stock Updates Reports; required stock columns remain fixed.
 - Admins can add, rename or delete stores under Admin → Locations. Store changes are reflected in item assignments, issue locations and store-specific stock update reports; deletion is blocked until remaining stock and active item assignments are cleared.
 - The Requests page lists issued requisitions under All Stock Requests and each active store, combining stock drawn from multiple batches into one request line. Administrators can correct the issue date, quantity, requester or issuer; removal is recorded as an auditable reversal and updates inventory and reports.
 - Record receipts by quantity, supplier, purchase reference, unit cost, batch number and optional expiry. Inventory tracks received batches and uses earliest-expiring stock first when issuing.
 - Record department requisitions with lines from multiple stores in one submission. The app validates each line against stock at its selected location and will not issue negative inventory.
 - Out-of-stock items remain visible in the stock-issue item list but are disabled and cannot be selected.
+- The app reconciles stale batch balances against their stock-movement ledger at startup and reconstructs positive legacy balances that have no matching batch, so inventory and issue availability use the same balance source.
 - Administrators can edit an item's previous-month opening quantity; corrections are recorded as auditable movements and cannot reduce stock below the amount already on hand.
 - Remove an item from the active inventory with its row action. Items with stock or movement history are archived to preserve their balance and audit trail; items with no history are deleted.
 - Admins can add or remove stock using a reasoned, auditable adjustment. Spoilage and expiry are recorded as their own stock-out movement types.
@@ -93,10 +95,14 @@ Generate all-store or store-specific requisition reports, stock-entry reports, a
 
 Gmail delivery needs an internet connection and a valid App Password. If mailing is not configured, report generation and local export still work.
 
-Administrators can use **Admin → Clear All** to reset inventory and other system records while retaining user accounts. Monthly inventory archives are cleared, the six default stores, default categories and standard requester lists are recreated, custom inventory columns and values are removed, custom Gmail settings are cleared, and the reset is recorded in the audit log. The action requires explicit typed confirmation.
+Administrators can use **Admin → Clear All** to reset inventory and other system records while retaining user accounts. Monthly inventory and request archives are cleared, the six default stores, default categories and standard requester lists are recreated, custom inventory columns and values are removed, custom Gmail settings are cleared, and the reset is recorded in the audit log. The action requires explicit typed confirmation.
 
 ## Database and privacy
 
 In local mode the SQLite database is `data/capitol-stock.sqlite`; the server binds to `127.0.0.1` only. In hosted mode the server uses `DATABASE_URL` and binds to the host-provided interface. Passwords are stored as salted scrypt hashes; active sessions are held in server memory and end on restart. The app uses same-origin HTTP-only cookies, CSRF checks, and requires HTTPS for cloud desktop URLs. Back up the local database before migration and the Supabase project regularly after going online.
 
 The supplied Apps Script endpoint redirected to Google sign-in in the available browser. The implementation uses the source code and requirements provided in the request; it does not connect to that Google Sheet.
+
+## Install on mobile
+
+Open the hosted HTTPS app in Chrome on Android and choose **Install app** or **Add to Home screen**. On iPhone or iPad, open the site in Safari, tap **Share**, then **Add to Home Screen**. The app opens standalone; a network connection is still required for sign-in and live inventory data.

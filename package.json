@@ -1,13 +1,13 @@
 {
   "name": "capitol-stock-management",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "private": true,
   "description": "Local-first desktop stock, requisition, water tracking and reporting app.",
   "main": "electron-main.js",
   "scripts": {
     "start": "node server.js",
     "import:cloud": "node scripts/import-sqlite-to-postgres.js",
-    "check": "node --check server.js && node --check postgres-adapter.js && node --check postgres-worker.js && node --check app.js && node --check electron-main.js && node --check scripts/download-node.js && node --check scripts/create-windows-icon.js && node --check scripts/import-sqlite-to-postgres.js && node scripts/test-postgres-adapter.js",
+    "check": "node --check server.js && node --check postgres-adapter.js && node --check postgres-worker.js && node --check app.js && node --check service-worker.js && node --check electron-main.js && node --check scripts/download-node.js && node --check scripts/create-windows-icon.js && node --check scripts/import-sqlite-to-postgres.js && node --check scripts/test-postgres-adapter.js && node scripts/test-stock-reconciliation.js",
     "package:win": "npm run check && node scripts/create-windows-icon.js && node scripts/download-node.js && electron-builder --win nsis"
   },
   "engines": {
@@ -36,6 +36,8 @@
       "postgres-adapter.js",
       "postgres-worker.js",
       "app.js",
+      "service-worker.js",
+      "manifest.json",
       "styles.css",
       "index.html",
       "assets/**/*",

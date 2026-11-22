@@ -1,0 +1,23 @@
+{
+  "name": "Capitol Stock Management",
+  "short_name": "Capitol Stock",
+  "description": "Inventory, stock requests and reports for Capitol.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f4f7fb",
+  "theme_color": "#10141c",
+  "icons": [
+    {
+      "src": "/assets/capitol-stock-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/assets/capitol-stock-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

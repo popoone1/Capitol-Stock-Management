@@ -4,6 +4,7 @@ const state = {
   inventory: { items: [], locations: [] },
   inventoryArchives: [],
   archivedItems: [],
+  requestArchives: [],
   inventorySection: "active",
   issueItems: [],
   dashboard: null,
@@ -20,6 +21,8 @@ const state = {
   openInventoryArchive: "",
   openArchiveStore: "",
   openRequestStore: "All Stock Requests",
+  openRequestArchive: "",
+  openRequestArchiveStore: "",
   busy: false,
   movementFilters: null,
   auditor: null,
@@ -513,11 +516,12 @@ function renderRequests(data = state.requests) {
   const stores = ["All Stock Requests", ...(state.bootstrap.stores || [])];
   if (!stores.includes(state.openRequestStore)) state.openRequestStore = stores[0];
   const admin = state.bootstrap.user.role === "admin";
-  const sections = stores.map(store => {
+  const renderSections = (rows, sectionStores, getOpen, getToggle, keyPrefix = "") => sectionStores.map(store => {
     const all = store === "All Stock Requests";
-    const rows = data.rows.filter(row => all || row.request_store === store);
-    const expanded = state.openRequestStore === store;
-    const body = rows.map(row => `<tr>
+    const storeRows = rows.filter(row => all || row.request_store === store);
+    const sectionKey = `${keyPrefix}${store}`;
+    const expanded = getOpen(sectionKey);
+    const body = storeRows.map(row => `<tr>
       <td>${prettyDate(row.request_date)}</td>
       <td><span class="sku">${esc(row.item_sku)}</span></td>
       <td><strong>${esc(row.item_name)}</strong>${!all ? "" : `<small class="cell-sub">${esc(row.request_store)}</small>`}</td>
@@ -527,9 +531,32 @@ function renderRequests(data = state.requests) {
       ${admin ? `<td><div class="admin-row-actions"><button class="button small secondary" data-action="edit-request" data-id="${esc(row.id)}">Edit</button><button class="button small danger" data-action="remove-request" data-id="${esc(row.id)}">Remove</button></div></td>` : ""}
     </tr>`).join("");
     const colspan = admin ? 7 : 6;
-    return `<section class="store-section"><button type="button" class="store-toggle ${expanded ? "active" : ""}" data-request-store="${esc(store)}" aria-expanded="${expanded}"><span>${esc(store)}</span><span class="store-count">${rows.length} ${rows.length === 1 ? "request" : "requests"}</span><span class="store-chevron">${expanded ? "−" : "+"}</span></button><div class="store-content" ${expanded ? "" : "hidden"}><div class="table-scroll"><table class="data-table wide-table"><thead><tr><th>DATE</th><th>SKU</th><th>ITEM</th><th>QUANTITY REQUESTED</th><th>REQUESTED USER</th><th>ISSUED BY</th>${admin ? "<th>ACTIONS</th>" : ""}</tr></thead><tbody>${body || `<tr><td colspan="${colspan}"><div class="empty-state"><span>◷</span><strong>No requests recorded</strong><p>Issued stock requests will appear here.</p></div></td></tr>`}</tbody></table></div></div></section>`;
+    return `<section class="store-section"><button type="button" class="store-toggle ${expanded ? "active" : ""}" ${getToggle}="${esc(sectionKey)}" aria-expanded="${expanded}"><span>${esc(store)}</span><span class="store-count">${storeRows.length} ${storeRows.length === 1 ? "request" : "requests"}</span><span class="store-chevron">${expanded ? "−" : "+"}</span></button><div class="store-content" ${expanded ? "" : "hidden"}><div class="table-scroll"><table class="data-table wide-table"><thead><tr><th>DATE</th><th>SKU</th><th>ITEM</th><th>QUANTITY REQUESTED</th><th>REQUESTED USER</th><th>ISSUED BY</th>${admin ? "<th>ACTIONS</th>" : ""}</tr></thead><tbody>${body || `<tr><td colspan="${colspan}"><div class="empty-state"><span>◷</span><strong>No requests recorded</strong><p>Issued stock requests will appear here.</p></div></td></tr>`}</tbody></table></div></div></section>`;
   }).join("");
-  return `${pageHeading("ISSUED STOCK HISTORY", "Requests", "Review stock issued to requesters by date and store.")}<section class="card inventory-card"><div class="store-list">${sections}</div><div class="table-note">Request quantities are combined across stock batches. Corrections and removals update inventory and reports; the movement audit retains the original history.</div></section>`;
+  const sections = renderSections(data.rows, stores, key => state.openRequestStore === key, "data-request-store");
+  const archives = (state.requestArchives || []).map(archive => {
+    const monthOpen = state.openRequestArchive === archive.month;
+    const monthLabel = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
+      .format(new Date(`${archive.month}-01T00:00:00Z`));
+    const archiveStores = ["All Stock Requests", ...archive.stores];
+    const archiveSections = renderSections(
+      archive.rows,
+      archiveStores,
+      key => state.openRequestArchiveStore === key,
+      "data-request-archive-store",
+      `${archive.month}::`,
+    );
+    return `<section class="store-section archive-month-section"><button type="button" class="store-toggle archive-month-toggle ${monthOpen ? "active" : ""}" data-request-archive="${esc(archive.month)}" aria-expanded="${monthOpen}"><span>${esc(monthLabel)} Requests</span><span class="store-count">${archive.rows.length} ${archive.rows.length === 1 ? "request" : "requests"}</span><span class="store-chevron">${monthOpen ? "−" : "+"}</span></button><div class="store-content archive-month-content" ${monthOpen ? "" : "hidden"}><div class="store-list">${archiveSections}</div></div></section>`;
+  }).join("");
+  const monthLabel = data.month
+    ? new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(`${data.month}-01T00:00:00Z`))
+    : "Current Month";
+  return `${pageHeading("ISSUED STOCK HISTORY", "Requests", "Review stock issued to requesters by date and store.")}<section class="card inventory-card"><div class="archive-heading"><span class="section-label">CURRENT MONTH</span><p>${esc(monthLabel)} requests; empty stores remain available for new requests.</p></div><div class="store-list">${sections}</div>${archives ? `<div class="request-month-archives"><div class="archive-heading"><span class="section-label">MONTHLY REQUEST ARCHIVES</span><p>Completed months with store-by-store issue history.</p></div><div class="store-list">${archives}</div></div>` : ""}<div class="table-note">Request quantities are combined across stock batches. Corrections and removals update inventory and reports; the movement audit retains the original history.</div></section>`;
+}
+
+function findStockRequest(id) {
+  return state.requests?.rows.find(entry => entry.id === id) ||
+    (state.requestArchives || []).flatMap(archive => archive.rows).find(entry => entry.id === id);
 }
 
 function renderDepartmentFields(department = "") {
@@ -871,7 +898,7 @@ function renderAdmin(data = state.admin) {
     const locations = data.locations.map(location => `<tr><td><input class="inline-edit" data-location-name="${location.id}" value="${esc(location.name)}" aria-label="Store name"></td><td><select class="user-active" data-location-active="${location.id}"><option value="true" ${location.active ? "selected" : ""}>Enabled</option><option value="false" ${!location.active ? "selected" : ""}>Deleted</option></select></td><td><div class="admin-row-actions"><button class="button small secondary" data-action="save-location" data-id="${location.id}">Save</button><button class="button small danger" data-action="delete-location" data-id="${location.id}" ${!location.active ? "disabled" : ""}>Delete</button></div></td></tr>`).join("");
     content = `<div class="admin-grid"><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">STOCK LOCATIONS</span><h2>Stores</h2><p>Edit store names or delete stores. Reassign active items and clear stock before deleting a store.</p></div></div><div class="table-scroll"><table class="data-table"><thead><tr><th>STORE</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>${locations}</tbody></table></div></section><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">EXPAND YOUR STORES</span><h2>Add store</h2></div></div><form id="location-form" class="stack-form">${field("STORE NAME *", "name", "text", { required: true, minlength: 2, maxlength: 80, placeholder: "e.g. Annex Store" })}<button type="submit" class="button primary">Add store</button></form></section></div>`;
   } else if (state.adminSection === "Clear All") {
-    content = `<section class="card admin-card reset-card"><div class="panel-heading"><div><span class="section-label">DESTRUCTIVE ADMIN ACTION</span><h2>Clear all system data</h2><p>This permanently removes inventory items, stock batches and movements, water records, monthly inventory archives, custom inventory columns and values, custom stores/categories, requesters and historical audit entries. All user accounts remain.</p></div><span class="reset-warning">!</span></div><div class="reset-details"><strong>What remains</strong><p>The app's standard stores, default categories and standard requester lists are restored so the system can be used again. Custom Gmail settings are cleared, and the reset itself is recorded in the audit log.</p></div><button type="button" class="button danger" data-action="clear-all">Clear All</button></section>`;
+    content = `<section class="card admin-card reset-card"><div class="panel-heading"><div><span class="section-label">DESTRUCTIVE ADMIN ACTION</span><h2>Clear all system data</h2><p>This permanently removes inventory items, stock batches and movements, water records, monthly inventory and request archives, custom inventory columns and values, custom stores/categories, requesters and historical audit entries. All user accounts remain.</p></div><span class="reset-warning">!</span></div><div class="reset-details"><strong>What remains</strong><p>The app's standard stores, default categories and standard requester lists are restored so the system can be used again. Custom Gmail settings are cleared, and the reset itself is recorded in the audit log.</p></div><button type="button" class="button danger" data-action="clear-all">Clear All</button></section>`;
   } else {
     const auditRows = data.audit.map(entry => `<tr><td>${prettyDateTime(entry.created_at)}</td><td>${esc(entry.actor_name)}</td><td>${esc(entry.action)}</td><td>${esc(entry.detail)}</td></tr>`).join("");
     content = `<section class="card admin-card"><div class="panel-heading"><div><span class="section-label">SECURITY &amp; CHANGE HISTORY</span><h2>Administrative audit log</h2><p>Recent account, stock, and configuration actions.</p></div></div><div class="table-scroll"><table class="data-table"><thead><tr><th>TIME</th><th>ACTOR</th><th>ACTION</th><th>DETAIL</th></tr></thead><tbody>${auditRows || `<tr><td colspan="4">No admin events yet.</td></tr>`}</tbody></table></div></section>`;
@@ -905,6 +932,7 @@ async function navigate(page) {
       render(renderInventory(state.inventory));
     } else if (page === "Requests") {
       state.requests = await api("/api/requests");
+      state.requestArchives = (await api("/api/requests/archives")).archives;
       render(renderRequests(state.requests));
     } else if (page === "Stock issue") {
       if (state.bootstrap.user.role === "auditor") {
@@ -1195,6 +1223,17 @@ document.addEventListener("click", async event => {
     render(renderRequests(state.requests));
     return;
   }
+  if (target.dataset.requestArchive) {
+    state.openRequestArchive = state.openRequestArchive === target.dataset.requestArchive ? "" : target.dataset.requestArchive;
+    state.openRequestArchiveStore = "";
+    render(renderRequests(state.requests));
+    return;
+  }
+  if (target.dataset.requestArchiveStore) {
+    state.openRequestArchiveStore = state.openRequestArchiveStore === target.dataset.requestArchiveStore ? "" : target.dataset.requestArchiveStore;
+    render(renderRequests(state.requests));
+    return;
+  }
   if (["new-item", "edit-item", "receipt-item"].includes(target.dataset.action)) {
     event.preventDefault();
     await withButtonLoading(target, "Opening…", () => openInventoryAction(target.dataset.action, target.dataset.id || ""));
@@ -1357,10 +1396,10 @@ document.addEventListener("click", async event => {
     const movement = state.transactions?.rows.find(entry => entry.id === target.dataset.id);
     if (movement && state.bootstrap.user.role === "admin") openModal(movementModal(movement));
   } else if (target.dataset.action === "edit-request") {
-    const request = state.requests?.rows.find(entry => entry.id === target.dataset.id);
+    const request = findStockRequest(target.dataset.id);
     if (request && state.bootstrap.user.role === "admin") openModal(requestModal(request));
   } else if (target.dataset.action === "remove-request") {
-    const request = state.requests?.rows.find(entry => entry.id === target.dataset.id);
+    const request = findStockRequest(target.dataset.id);
     if (request && state.bootstrap.user.role === "admin") openModal(voidMovementModal(request, true));
   } else if (target.dataset.action === "void-movement") {
     const movement = state.transactions?.rows.find(entry => entry.id === target.dataset.id) ||
@@ -2044,3 +2083,8 @@ async function applyMovementFilters() {
 }
 
 initialize();
+
+if ("serviceWorker" in navigator && window.location.protocol !== "file:") {
+  navigator.serviceWorker.register("/service-worker.js")
+    .catch(error => console.error("Service worker registration failed:", error));
+}

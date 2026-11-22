@@ -785,6 +785,8 @@ a { color: inherit; text-decoration: none; }
 .archive-month-toggle.active { color: var(--ink); }
 .archive-month-content > .store-list { padding-top: 11px; }
 .archive-store-section { margin-left: 10px; }
+.request-month-archives { padding-top: 15px; border-top: 1px solid var(--line); }
+.request-month-archives .archive-month-content > .store-list { padding-top: 11px; }
 @media (max-width: 600px) {
   #app .topbar-right { gap: 6px; }
   #app .network-status { max-width: 36px; overflow: hidden; padding: 0 10px; }

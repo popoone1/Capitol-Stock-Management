@@ -382,9 +382,18 @@ db.exec(`
     created_at TEXT NOT NULL
   )
 `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS requests_month_archives (
+    month TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )
+`);
 if (usePostgres) {
   db.exec("ALTER TABLE inventory_month_archives ENABLE ROW LEVEL SECURITY");
   db.exec("REVOKE ALL ON TABLE inventory_month_archives FROM anon, authenticated");
+  db.exec("ALTER TABLE requests_month_archives ENABLE ROW LEVEL SECURITY");
+  db.exec("REVOKE ALL ON TABLE requests_month_archives FROM anon, authenticated");
 }
 
 if (!db.prepare("SELECT 1 FROM settings WHERE key = 'inventory_store_migration_v3'").get()) {
@@ -397,6 +406,8 @@ if (!db.prepare("SELECT 1 FROM settings WHERE key = 'inventory_store_migration_v
     db.prepare("INSERT INTO settings (key, value) VALUES ('inventory_store_migration_v3', '1')").run();
   });
 }
+
+reconcileStockBatches();
 
 const sessions = new Map();
 const loginAttempts = new Map();
@@ -869,6 +880,188 @@ function ensurePreviousMonthInventoryArchive() {
 function listInventoryArchives() {
   return db.prepare("SELECT month, payload, created_at FROM inventory_month_archives ORDER BY month DESC")
     .all().map(row => ({ ...JSON.parse(row.payload), created_at: row.created_at }));
+}
+
+function stockRequestRows(from, to, store = "", activeStoreOnly = false) {
+  return db.prepare(`
+    SELECT COALESCE(t.request_group_id, t.id) AS id, t.request_group_id, t.item_id,
+      t.request_date, t.item_sku, t.item_name, SUM(t.quantity) AS quantity,
+      ABS(SUM(t.quantity)) AS quantity_requested, t.unit, t.department, t.person, t.area,
+      t.issued_by, t.kind, t.created_by, MAX(t.created_at) AS created_at,
+      COALESCE(l.name, t.location_name) AS request_store
+    FROM stock_transactions t
+    LEFT JOIN locations l ON l.id = t.location_id
+    WHERE t.quantity < 0 AND t.kind IN ('requisition', 'issue')
+      AND t.voided_at IS NULL AND t.reversal_of IS NULL
+      AND t.request_date >= ? AND t.request_date <= ?
+      AND (? = '' OR COALESCE(l.name, t.location_name) = ?)
+      AND (? = 0 OR l.active = 1)
+    GROUP BY COALESCE(t.request_group_id, t.id), t.request_group_id, t.item_id,
+      t.request_date, t.item_sku, t.item_name, t.unit, t.department, t.person, t.area,
+      t.issued_by, t.kind, t.created_by, COALESCE(l.name, t.location_name)
+    ORDER BY t.request_date DESC, MAX(t.created_at) DESC, t.item_name COLLATE NOCASE
+  `).all(from, to, store, store, activeStoreOnly ? 1 : 0);
+}
+
+function buildRequestsMonthArchive(month) {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const monthStart = `${month}-01`;
+  const monthEnd = new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
+  const rows = stockRequestRows(monthStart, monthEnd);
+  const stores = new Set(db.prepare("SELECT name FROM locations").all().map(row => row.name));
+  for (const row of rows) if (row.request_store) stores.add(row.request_store);
+  return { month, stores: [...stores].sort((first, second) => first.localeCompare(second)), rows };
+}
+
+function refreshRequestsMonthArchive(month) {
+  if (!month || !db.prepare("SELECT 1 FROM requests_month_archives WHERE month = ?").get(month)) return;
+  const payload = buildRequestsMonthArchive(month);
+  db.prepare("UPDATE requests_month_archives SET payload = ?, created_at = ? WHERE month = ?")
+    .run(JSON.stringify(payload), nowIso(), month);
+}
+
+function ensureRequestsMonthArchives() {
+  const currentMonthStart = `${todayKey().slice(0, 7)}-01`;
+  const previousMonth = previousMonthKey(currentMonthStart.slice(0, 7));
+  const months = new Set(db.prepare(`
+    SELECT DISTINCT substr(request_date, 1, 7) AS month
+    FROM stock_transactions
+    WHERE request_date < ? AND quantity < 0 AND kind IN ('requisition', 'issue')
+      AND voided_at IS NULL AND reversal_of IS NULL
+  `).all(currentMonthStart).map(row => row.month));
+  months.add(previousMonth);
+  for (const month of months) {
+    if (db.prepare("SELECT 1 FROM requests_month_archives WHERE month = ?").get(month)) continue;
+    const payload = buildRequestsMonthArchive(month);
+    db.prepare(`
+      INSERT INTO requests_month_archives (month, payload, created_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(month) DO NOTHING
+    `).run(month, JSON.stringify(payload), nowIso());
+  }
+}
+
+function listRequestsMonthArchives() {
+  return db.prepare("SELECT month, payload, created_at FROM requests_month_archives ORDER BY month DESC")
+    .all().map(row => {
+      const payload = buildRequestsMonthArchive(row.month);
+      const serialized = JSON.stringify(payload);
+      if (serialized !== row.payload) {
+        db.prepare("UPDATE requests_month_archives SET payload = ? WHERE month = ?").run(serialized, row.month);
+      }
+      return { ...payload, created_at: row.created_at };
+    });
+}
+
+function reconcileStockBatches() {
+  const movements = db.prepare(`
+    SELECT t.id, t.item_id, t.batch_id, t.location_id, t.location_name, t.quantity, t.request_date
+    FROM stock_transactions t
+    WHERE t.item_id IS NOT NULL AND t.voided_at IS NULL AND t.reversal_of IS NULL
+    ORDER BY t.request_date, t.created_at, t.id
+  `).all();
+  const expectedBalances = new Map();
+  const batchBalances = new Map();
+  let unresolvedMovements = 0;
+
+  for (const movement of movements) {
+    let location = movement.location_id
+      ? db.prepare("SELECT id, name FROM locations WHERE id = ?").get(movement.location_id)
+      : null;
+    if (!location) {
+      location = db.prepare("SELECT id, name FROM locations WHERE name = ? COLLATE NOCASE").get(movement.location_name);
+    }
+    if (!location) {
+      unresolvedMovements += 1;
+      continue;
+    }
+    const balanceKey = `${movement.item_id}\u0000${location.id}`;
+    const balance = expectedBalances.get(balanceKey) || {
+      itemId: movement.item_id,
+      locationId: location.id,
+      locationName: location.name,
+      received: 0,
+      remaining: 0,
+      receivedAt: "",
+    };
+    const quantity = Number(movement.quantity);
+    balance.remaining += quantity;
+    if (quantity > 0) {
+      balance.received += quantity;
+      if (!balance.receivedAt || movement.request_date < balance.receivedAt) balance.receivedAt = movement.request_date;
+    }
+    expectedBalances.set(balanceKey, balance);
+
+    if (movement.batch_id) {
+      const batchBalance = batchBalances.get(movement.batch_id) || {
+        received: 0,
+        remaining: 0,
+        locations: new Set(),
+      };
+      batchBalance.remaining += quantity;
+      if (quantity > 0) batchBalance.received += quantity;
+      batchBalance.locations.add(location.id);
+      batchBalances.set(movement.batch_id, batchBalance);
+    }
+  }
+
+  let correctedBatches = 0;
+  let recoveredBalances = 0;
+  let unresolvedBalances = 0;
+  transaction(() => {
+    for (const [batchId, expected] of batchBalances) {
+      if (expected.received <= 0) continue;
+      if (expected.locations.size !== 1 ||
+          expected.remaining < -0.000001 || expected.remaining > expected.received + 0.000001) {
+        unresolvedBalances += 1;
+        continue;
+      }
+      const batch = db.prepare("SELECT * FROM batches WHERE id = ?").get(batchId);
+      if (!batch) continue;
+      const received = Math.round(expected.received * 1_000_000) / 1_000_000;
+      const remaining = Math.max(0, Math.round(expected.remaining * 1_000_000) / 1_000_000);
+      const locationId = [...expected.locations][0];
+      if (Math.abs(Number(batch.quantity_received) - received) > 0.000001 ||
+          Math.abs(Number(batch.quantity_remaining) - remaining) > 0.000001 ||
+          batch.location_id !== locationId) {
+        db.prepare("UPDATE batches SET quantity_received = ?, quantity_remaining = ?, location_id = ? WHERE id = ?")
+          .run(received, remaining, locationId, batchId);
+        correctedBatches += 1;
+      }
+    }
+
+    const actualBalances = new Map();
+    for (const batch of db.prepare("SELECT item_id, location_id, SUM(quantity_remaining) AS quantity FROM batches GROUP BY item_id, location_id").all()) {
+      actualBalances.set(`${batch.item_id}\u0000${batch.location_id}`, Number(batch.quantity));
+    }
+    for (const [key, expected] of expectedBalances) {
+      if (expected.received <= 0 || expected.remaining < -0.000001) {
+        if (expected.remaining < -0.000001) unresolvedBalances += 1;
+        continue;
+      }
+      const difference = Math.round((expected.remaining - (actualBalances.get(key) || 0)) * 1_000_000) / 1_000_000;
+      if (difference <= 0.000001) {
+        if (difference < -0.000001) unresolvedBalances += 1;
+        continue;
+      }
+      db.prepare(`
+        INSERT INTO batches (
+          id, item_id, location_id, batch_number, quantity_received, quantity_remaining, received_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        crypto.randomUUID(), expected.itemId, expected.locationId, "Legacy balance reconciliation",
+        difference, difference, expected.receivedAt || todayKey(),
+      );
+      recoveredBalances += 1;
+    }
+  });
+
+  if (correctedBatches || recoveredBalances || unresolvedBalances || unresolvedMovements) {
+    console.info(
+      `Stock balance reconciliation: ${correctedBatches} batches corrected, ` +
+      `${recoveredBalances} legacy balances recovered, ${unresolvedBalances + unresolvedMovements} unresolved.`,
+    );
+  }
 }
 
 function stockItems({ includeInactive = false, search = "", category = "", locationId = "", store = "" } = {}) {
@@ -1852,6 +2045,8 @@ function updateStockRequest(id, body, actor) {
     addAudit(actor, "stock.request.update",
       `${first.item_sku}: ${Math.abs(movements.reduce((sum, movement) => sum + Number(movement.quantity), 0))} → ${quantity}; date=${first.request_date} → ${requestDate}`);
   });
+  refreshRequestsMonthArchive(first.request_date.slice(0, 7));
+  refreshRequestsMonthArchive(requestDate.slice(0, 7));
   return { updated: true };
 }
 
@@ -1865,6 +2060,7 @@ function voidStockRequest(id, body, actor) {
     const quantity = movements.reduce((sum, movement) => sum + Math.abs(Number(movement.quantity)), 0);
     addAudit(actor, "stock.request.remove", `${movements[0].item_sku} × ${quantity}: ${reason}`);
   });
+  refreshRequestsMonthArchive(movements[0].request_date.slice(0, 7));
   return { removed: true };
 }
 
@@ -2252,6 +2448,7 @@ function resetSystemData(actor) {
     items: Number(db.prepare("SELECT COUNT(*) AS count FROM items").get().count),
     batches: Number(db.prepare("SELECT COUNT(*) AS count FROM batches").get().count),
     inventoryArchives: Number(db.prepare("SELECT COUNT(*) AS count FROM inventory_month_archives").get().count),
+    requestArchives: Number(db.prepare("SELECT COUNT(*) AS count FROM requests_month_archives").get().count),
     waterRecords: Number(db.prepare("SELECT COUNT(*) AS count FROM water_records").get().count),
     requesters: Number(db.prepare("SELECT COUNT(*) AS count FROM requesters").get().count),
     users: Number(db.prepare("SELECT COUNT(*) AS count FROM users").get().count),
@@ -2262,6 +2459,7 @@ function resetSystemData(actor) {
       DELETE FROM batches;
       DELETE FROM items;
       DELETE FROM inventory_month_archives;
+      DELETE FROM requests_month_archives;
       DELETE FROM inventory_columns;
       DELETE FROM water_records;
       DELETE FROM requesters;
@@ -2552,24 +2750,15 @@ route("GET", "/api/requests", request => {
   requireSession(request);
   const store = new URL(request.url, `http://${HOST}:${PORT}`).searchParams.get("store") || "";
   if (store && !getLocations().some(location => location.name === store)) throw httpError(400, "Choose a valid store.");
-  const rows = db.prepare(`
-    SELECT COALESCE(t.request_group_id, t.id) AS id, t.request_group_id, t.item_id,
-      t.request_date, t.item_sku, t.item_name, SUM(t.quantity) AS quantity,
-      ABS(SUM(t.quantity)) AS quantity_requested, t.unit, t.department, t.person, t.area,
-      t.issued_by, t.kind, t.created_by, MAX(t.created_at) AS created_at,
-      COALESCE(l.name, t.location_name) AS request_store
-    FROM stock_transactions t
-    LEFT JOIN items i ON i.id = t.item_id
-    LEFT JOIN locations l ON l.id = t.location_id
-    WHERE t.quantity < 0 AND t.kind IN ('requisition', 'issue')
-      AND t.voided_at IS NULL AND t.reversal_of IS NULL
-      AND (? = '' OR (l.active = 1 AND l.name = ?))
-    GROUP BY COALESCE(t.request_group_id, t.id), t.request_group_id, t.item_id,
-      t.request_date, t.item_sku, t.item_name, t.unit, t.department, t.person, t.area,
-      t.issued_by, t.kind, t.created_by, COALESCE(l.name, t.location_name)
-    ORDER BY t.request_date DESC, MAX(t.created_at) DESC, t.item_name COLLATE NOCASE
-  `).all(store, store);
-  return { rows, count: rows.length };
+  ensureRequestsMonthArchives();
+  const month = todayKey().slice(0, 7);
+  const rows = stockRequestRows(`${month}-01`, todayKey(), store, Boolean(store));
+  return { month, stores: getLocations().map(location => location.name), rows, count: rows.length };
+});
+route("GET", "/api/requests/archives", request => {
+  requireSession(request);
+  ensureRequestsMonthArchives();
+  return { archives: listRequestsMonthArchives() };
 });
 route("GET", "/api/water", request => {
   requireSession(request);
@@ -2895,8 +3084,13 @@ function serveStatic(request, response, pathname) {
     ["/index.html", "index.html"],
     ["/styles.css", "styles.css"],
     ["/app.js", "app.js"],
+    ["/manifest.json", "manifest.json"],
+    ["/service-worker.js", "service-worker.js"],
     ["/assets/capitol-catering-logo.png", path.join("assets", "capitol-catering-logo.png")],
     ["/assets/capitol-catering-icon.png", path.join("assets", "capitol-catering-icon.png")],
+    ["/assets/capitol-stock-icon-180.png", path.join("assets", "capitol-stock-icon-180.png")],
+    ["/assets/capitol-stock-icon-192.png", path.join("assets", "capitol-stock-icon-192.png")],
+    ["/assets/capitol-stock-icon-512.png", path.join("assets", "capitol-stock-icon-512.png")],
     ["/assets/fonts/inter-regular.ttf", path.join("assets", "fonts", "inter-regular.ttf")],
     ["/assets/fonts/inter-bold.ttf", path.join("assets", "fonts", "inter-bold.ttf")],
     ["/assets/fonts/manrope-regular.ttf", path.join("assets", "fonts", "manrope-regular.ttf")],
@@ -2980,6 +3174,11 @@ server.listen(PORT, HOST, () => {
       ensurePreviousMonthInventoryArchive();
     } catch (error) {
       console.error("Monthly inventory archive could not be created:", error.message);
+    }
+    try {
+      ensureRequestsMonthArchives();
+    } catch (error) {
+      console.error("Monthly requests archive could not be created:", error.message);
     }
   };
   createPreviousMonthArchive();
