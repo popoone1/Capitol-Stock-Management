@@ -954,6 +954,10 @@ function listRequestsMonthArchives() {
 }
 
 function reconcileStockBatches() {
+  const locationsById = new Map(db.prepare("SELECT id, name FROM locations").all().map(location => [location.id, location]));
+  const locationsByName = new Map([...locationsById.values()].map(location => [location.name.toLocaleLowerCase(), location]));
+  const storesByItem = new Map(db.prepare("SELECT id, store FROM items").all()
+    .map(item => [item.id, item.store]));
   const movements = db.prepare(`
     SELECT t.id, t.item_id, t.batch_id, t.location_id, t.location_name, t.quantity, t.request_date
     FROM stock_transactions t
@@ -965,12 +969,10 @@ function reconcileStockBatches() {
   let unresolvedMovements = 0;
 
   for (const movement of movements) {
-    let location = movement.location_id
-      ? db.prepare("SELECT id, name FROM locations WHERE id = ?").get(movement.location_id)
-      : null;
-    if (!location) {
-      location = db.prepare("SELECT id, name FROM locations WHERE name = ? COLLATE NOCASE").get(movement.location_name);
-    }
+    const store = storesByItem.get(movement.item_id);
+    const location = locationsByName.get(String(store || "").toLocaleLowerCase()) ||
+      locationsById.get(movement.location_id) ||
+      locationsByName.get(String(movement.location_name || "").toLocaleLowerCase());
     if (!location) {
       unresolvedMovements += 1;
       continue;
@@ -1005,10 +1007,20 @@ function reconcileStockBatches() {
     }
   }
 
-  let correctedBatches = 0;
+  const correctedBatchIds = new Set();
   let recoveredBalances = 0;
   let unresolvedBalances = 0;
   transaction(() => {
+    const batches = db.prepare("SELECT id, item_id, location_id FROM batches").all();
+    for (const batch of batches) {
+      const store = storesByItem.get(batch.item_id);
+      const location = locationsByName.get(String(store || "").toLocaleLowerCase());
+      if (location && batch.location_id !== location.id) {
+        db.prepare("UPDATE batches SET location_id = ? WHERE id = ?").run(location.id, batch.id);
+        correctedBatchIds.add(batch.id);
+      }
+    }
+
     for (const [batchId, expected] of batchBalances) {
       if (expected.received <= 0) continue;
       if (expected.locations.size !== 1 ||
@@ -1022,11 +1034,10 @@ function reconcileStockBatches() {
       const remaining = Math.max(0, Math.round(expected.remaining * 1_000_000) / 1_000_000);
       const locationId = [...expected.locations][0];
       if (Math.abs(Number(batch.quantity_received) - received) > 0.000001 ||
-          Math.abs(Number(batch.quantity_remaining) - remaining) > 0.000001 ||
-          batch.location_id !== locationId) {
+          Math.abs(Number(batch.quantity_remaining) - remaining) > 0.000001) {
         db.prepare("UPDATE batches SET quantity_received = ?, quantity_remaining = ?, location_id = ? WHERE id = ?")
           .run(received, remaining, locationId, batchId);
-        correctedBatches += 1;
+        correctedBatchIds.add(batchId);
       }
     }
 
@@ -1056,6 +1067,7 @@ function reconcileStockBatches() {
     }
   });
 
+  const correctedBatches = correctedBatchIds.size;
   if (correctedBatches || recoveredBalances || unresolvedBalances || unresolvedMovements) {
     console.info(
       `Stock balance reconciliation: ${correctedBatches} batches corrected, ` +
@@ -1224,6 +1236,9 @@ function addMovement({ kind, item, batchId = null, location, quantity, departmen
 
 function receiveBatch(body, actor, item, defaults = {}) {
   const location = locationById(body.locationId || defaults.locationId || "");
+  if (location.name.toLocaleLowerCase() !== String(item.store || "").toLocaleLowerCase()) {
+    throw httpError(400, `Receive ${item.name} at its assigned store, ${item.store}.`);
+  }
   const quantity = positiveItemQuantity(body.quantity, item.name);
   const unitCost = body.unitCost === "" || body.unitCost === undefined ? 0 : Number(body.unitCost);
   if (!Number.isFinite(unitCost) || unitCost < 0 || unitCost > 1_000_000_000) throw httpError(400, "Unit cost must be zero or a positive amount.");
@@ -1445,27 +1460,24 @@ function updateItem(id, body, actor) {
   }
   const previousMonthDelta = previousMonthQuantity - currentPreviousMonthQuantity;
   const receivedStockDelta = receivedStockQuantity - currentReceivedStockQuantity;
+  const storeLocation = db.prepare("SELECT id FROM locations WHERE name = ? COLLATE NOCASE AND active = 1").get(store);
+  if (!storeLocation) throw httpError(409, "Assign this item to an active stock location before correcting its stock.");
   transaction(() => {
     db.prepare(`
       UPDATE items SET sku = ?, name = ?, category = ?, store = ?, unit = ?, description = '', reorder_level = ?, updated_at = ?
       WHERE id = ?
     `).run(sku, name, category, store, unit, reorderLevel, nowIso(), existing.id);
+    db.prepare("UPDATE batches SET location_id = ? WHERE item_id = ? AND location_id <> ?")
+      .run(storeLocation.id, existing.id, storeLocation.id);
     if (previousMonthDelta > 0) {
       const monthStart = `${todayKey().slice(0, 7)}-01`;
       const [year, month] = monthStart.split("-").map(Number);
       const previousMonthEnd = new Date(Date.UTC(year, month - 1, 0)).toISOString().slice(0, 10);
-      const batchLocation = db.prepare(`
-        SELECT location_id FROM batches WHERE item_id = ? AND location_id IS NOT NULL
-        ORDER BY received_at, id LIMIT 1
-      `).get(existing.id)?.location_id;
-      const storeLocation = db.prepare("SELECT id FROM locations WHERE name = ? COLLATE NOCASE AND active = 1").get(store)?.id;
-      const locationId = batchLocation || storeLocation;
-      if (!locationId) throw httpError(409, "Assign this item to an active stock location before correcting its opening quantity.");
       receiveBatch({
-        locationId,
+        locationId: storeLocation.id,
         quantity: previousMonthDelta,
         reason: "Previous month stock correction",
-      }, actor, { ...existing, sku, name, unit }, {
+      }, actor, { ...existing, sku, name, store, unit }, {
         movementKind: "adjustment",
         receivedDate: previousMonthEnd,
       });
@@ -1498,13 +1510,11 @@ function updateItem(id, body, actor) {
       }
     }
     if (receivedStockDelta > 0.000001) {
-      const location = db.prepare("SELECT id FROM locations WHERE name = ? COLLATE NOCASE AND active = 1").get(store);
-      if (!location) throw httpError(409, "Assign this item to an active stock location before correcting received stock.");
       receiveBatch({
-        locationId: location.id,
+        locationId: storeLocation.id,
         quantity: receivedStockDelta,
         reason: "Current month received stock correction",
-      }, actor, { ...existing, sku, name, unit });
+      }, actor, { ...existing, sku, name, store, unit });
     } else if (receivedStockDelta < -0.000001) {
       let quantityToRemove = -receivedStockDelta;
       const receipts = db.prepare(`
@@ -2025,7 +2035,7 @@ function updateStockRequest(id, body, actor) {
   const issuedBy = String(body.issuedBy ?? first.issued_by).trim().slice(0, 120);
   const item = db.prepare("SELECT * FROM items WHERE id = ?").get(first.item_id);
   if (!item) throw httpError(409, "The requested catalog item no longer exists.");
-  const location = db.prepare("SELECT id, name FROM locations WHERE id = ? AND active = 1").get(first.location_id);
+  const location = db.prepare("SELECT id, name FROM locations WHERE name = ? COLLATE NOCASE AND active = 1").get(item.store);
   if (!location) throw httpError(409, "The request's store is no longer active.");
   const requestGroupId = first.request_group_id || id;
   const reason = `Correction of stock request ${id}`;

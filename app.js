@@ -1,5 +1,6 @@
 const state = {
   bootstrap: null,
+  startupLoading: false,
   page: "Dashboard",
   inventory: { items: [], locations: [] },
   inventoryArchives: [],
@@ -811,8 +812,10 @@ function itemModal(item = null) {
 }
 
 function stockModal(action, item) {
+  const assignedLocation = state.inventory.locations.find(location =>
+    location.name.toLocaleLowerCase() === item.store.toLocaleLowerCase());
   return `<div class="modal-backdrop" data-action="close-modal"><section class="modal" role="dialog" aria-modal="true"><div class="modal-heading"><div><span class="section-label">GOODS RECEIVED</span><h2>Receive stock</h2><p><strong>${esc(item.name)} · ${esc(item.sku)}</strong> · current balance ${number(item.on_hand)} ${esc(item.unit)}.</p></div><button type="button" class="modal-close" data-action="close-modal">×</button></div>
-    <form id="receipt-form" data-item-id="${item.id}"><div class="form-grid two-col">${field("QUANTITY RECEIVED *", "quantity", "number", { required: true, min: "0.001", step: "0.001", placeholder: "Enter received quantity" })}${field("LOCATION *", "locationId", "text", { required: true, select: state.inventory.locations.map(location => ({ value: location.id, label: location.name })) })}${field("SUPPLIER", "supplier", "text", { maxlength: 160, placeholder: "Supplier or vendor" })}${field("PURCHASE / DELIVERY REF", "purchaseReference", "text", { maxlength: 120, placeholder: "Invoice or delivery note" })}${field("UNIT COST", "unitCost", "number", { min: 0, step: "0.01", value: 0 })}${field("BATCH NUMBER", "batchNumber", "text", { maxlength: 120, placeholder: "Optional batch ID" })}${field("EXPIRY DATE", "expiryDate", "date", {})}<label class="form-field wide-field"><span>NOTES</span><textarea name="notes" rows="2" maxlength="1000" placeholder="Optional notes"></textarea></label></div><div class="modal-actions"><button type="button" class="button secondary" data-action="close-modal">Cancel</button><button type="submit" class="button primary">Save receipt</button></div></form></section></div>`;
+    <form id="receipt-form" data-item-id="${item.id}"><div class="form-grid two-col">${field("QUANTITY RECEIVED *", "quantity", "number", { required: true, min: "0.001", step: "0.001", placeholder: "Enter received quantity" })}${field("STORE *", "locationId", "text", { required: true, select: assignedLocation ? [{ value: assignedLocation.id, label: assignedLocation.name }] : [], value: assignedLocation?.id || "" })}${field("SUPPLIER", "supplier", "text", { maxlength: 160, placeholder: "Supplier or vendor" })}${field("PURCHASE / DELIVERY REF", "purchaseReference", "text", { maxlength: 120, placeholder: "Invoice or delivery note" })}${field("UNIT COST", "unitCost", "number", { min: 0, step: "0.01", value: 0 })}${field("BATCH NUMBER", "batchNumber", "text", { maxlength: 120, placeholder: "Optional batch ID" })}${field("EXPIRY DATE", "expiryDate", "date", {})}<label class="form-field wide-field"><span>NOTES</span><textarea name="notes" rows="2" maxlength="1000" placeholder="Optional notes"></textarea></label></div><div class="modal-actions"><button type="button" class="button secondary" data-action="close-modal">Cancel</button><button type="submit" class="button primary">Save receipt</button></div></form></section></div>`;
 }
 
 function waterRecordModal(record) {
@@ -917,10 +920,13 @@ async function navigate(page) {
   }
   state.page = page;
   state.report = null;
-  render(`<div class="loading-content"><span class="spinner"></span> Loading ${esc(page.toLowerCase())}…</div>`);
+  const keepStartupSplash = state.startupLoading && page === "Dashboard";
+  if (!keepStartupSplash) render(`<div class="loading-content"><span class="spinner"></span> Loading ${esc(page.toLowerCase())}…</div>`);
   try {
     if (page === "Dashboard") {
-      render(renderDashboard(await api("/api/dashboard")));
+      const dashboard = await api("/api/dashboard");
+      state.startupLoading = false;
+      render(renderDashboard(dashboard));
     } else if (page === "Inventory") {
       state.inventorySection = "active";
       state.inventory = await api("/api/inventory");
@@ -973,6 +979,7 @@ async function navigate(page) {
     }
     return true;
   } catch (error) {
+    state.startupLoading = false;
     render(`<div class="error-state"><strong>Could not load ${esc(page.toLowerCase())}</strong><p>${esc(error.message)}</p><button class="button primary" data-action="retry">Try again</button></div>`);
     return false;
   }
@@ -1012,17 +1019,32 @@ function showLogin() {
 }
 
 async function initialize() {
+  state.startupLoading = true;
+  app.innerHTML = startupSplashMarkup();
   startConnectionMonitor();
   try {
     state.bootstrap = await api("/api/bootstrap");
     state.appearanceDraft = null;
     applyAppearance();
-    if (state.bootstrap.setupRequired) showSetup();
-    else if (!state.bootstrap.user) showLogin();
+    if (state.bootstrap.setupRequired) {
+      state.startupLoading = false;
+      showSetup();
+    } else if (!state.bootstrap.user) {
+      state.startupLoading = false;
+      showLogin();
+    }
     else await navigate("Dashboard");
   } catch (error) {
+    state.startupLoading = false;
     app.innerHTML = `<section class="fatal-screen"><span>!</span><h1>App server unavailable</h1><p>${esc(error.message)}</p><button class="button primary" data-action="initialize">Retry connection</button></section>`;
   }
+}
+
+function startupSplashMarkup() {
+  const hostname = window.location.hostname.toLocaleLowerCase();
+  const localWorkspace = ["localhost", "127.0.0.1", "::1"].includes(hostname);
+  const serviceName = hostname.endsWith(".onrender.com") ? "Render" : "your online workspace";
+  return `<div class="boot-screen" aria-live="polite"><div class="boot-card"><img class="boot-logo" src="/assets/capitol-catering-icon.png" alt=""><span class="boot-brand">CAPITOL STOCK MANAGEMENT</span><span class="spinner" aria-hidden="true"></span><strong class="boot-status">${localWorkspace ? "Opening your local workspace…" : `Connecting to ${serviceName}…`}</strong><p class="boot-detail">${localWorkspace ? "Loading your local inventory and account details." : "Fetching live inventory and account details from the hosted server."}</p></div></div>`;
 }
 
 function formValues(form) {

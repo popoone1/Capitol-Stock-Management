@@ -1,4 +1,4 @@
-const CACHE_NAME = "capitol-stock-shell-v1";
+const CACHE_NAME = "capitol-stock-shell-v2";
 const SHELL_PATHS = [
   "/",
   "/index.html",
