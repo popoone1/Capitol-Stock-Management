@@ -226,7 +226,7 @@ async function startServer() {
 
 function createWindow(url) {
   const appUrl = new URL(url);
-  if (app.isPackaged) appUrl.searchParams.set("desktopVersion", app.getVersion());
+  appUrl.searchParams.set("desktopVersion", app.getVersion());
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,

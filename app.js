@@ -41,6 +41,7 @@ const state = {
 
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
+const GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/popoone1/Capitol-Stock-Management/releases/latest";
 const APPEARANCE_FONTS = {
   inter: "Inter",
   manrope: "Manrope",
@@ -376,7 +377,7 @@ function shell(content) {
     <main class="main-shell">
       <header class="topbar"><div><div class="breadcrumb"><span>Capitol</span><span>/</span><strong>${esc(state.page)}</strong></div><p>Inventory, requisitions &amp; distribution</p></div><div class="topbar-right">${connectionMarkup()}<button type="button" class="refresh-button" data-action="refresh" aria-label="Refresh current section" title="Refresh current section">↻<span>Refresh</span></button><button type="button" class="theme-toggle" data-action="toggle-theme" aria-label="Switch to ${state.theme === "dark" ? "light" : "dark"} theme" title="Switch theme">${state.theme === "dark" ? "☀" : "☾"}</button><span class="today-chip"><i></i>${prettyDate(dateKey())}</span><span class="avatar" title="${esc(user.displayName)}">${esc(user.displayName.split(/\s+/).slice(0, 2).map(part => part[0]).join("").toUpperCase())}</span><button class="topbar-logout" data-action="logout">Log out</button></div></header>
       <div id="desktop-update-notice-slot">${desktopUpdateMarkup()}</div><section id="page-content" class="page-content">${content}</section>
-      <footer class="footer"><span><i></i> ${state.bootstrap.passwordPolicy === "strong" ? "Shared workspace" : "Private workspace"}</span><span>CAPITOL STOCK MANAGEMENT</span></footer>
+      <footer class="footer"><span><i></i> ${state.bootstrap.passwordPolicy === "strong" ? "Shared workspace" : "Private workspace"}</span><span>CAPITOL STOCK MANAGEMENT</span>${desktopAppVersionMarkup()}</footer>
     </main>
   </div><div id="modal-root"></div>`;
   applyAppearance();
@@ -395,10 +396,7 @@ function compareVersions(first, second) {
 
 function desktopUpdateMarkup() {
   const update = state.desktopUpdate;
-  if (!update) return "";
-  if (update.phase === "check-error") {
-    return `<aside class="desktop-update-notice" role="status"><span aria-hidden="true">↻</span><div><strong>Could not check for the latest desktop version</strong><small>${esc(update.error || "Check your connection and try again.")}</small></div><button class="button secondary" type="button" data-action="check-desktop-update">Check again</button></aside>`;
-  }
+  if (!update || update.phase === "check-error") return "";
   const current = update.current === "unknown" ? "Older desktop build" : `Installed ${esc(update.current)}`;
   let action = "";
   if (update.phase === "checking") {
@@ -432,8 +430,39 @@ function detectDesktopUpdate() {
     state.desktopUpdate = null;
     return;
   }
-  const current = new URLSearchParams(window.location.search).get("desktopVersion") || "unknown";
-  return current;
+  return getInstalledDesktopVersion() || "unknown";
+}
+
+function getInstalledDesktopVersion() {
+  if (!/Electron\//i.test(navigator.userAgent)) return "";
+  return new URLSearchParams(window.location.search).get("desktopVersion") || "";
+}
+
+function desktopAppVersionMarkup() {
+  const version = getInstalledDesktopVersion();
+  return version ? `<span class="desktop-app-version">Desktop app v${esc(version)}</span>` : "";
+}
+
+async function fetchLatestDesktopRelease() {
+  const response = await fetch(GITHUB_LATEST_RELEASE_URL, {
+    headers: { Accept: "application/vnd.github+json" },
+    cache: "no-store",
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error(`GitHub release check failed (${response.status}).`);
+  const release = await response.json();
+  const tag = String(release.tag_name || "");
+  const version = tag.replace(/^v/i, "");
+  if (!/^\d+\.\d+\.\d+$/.test(version) || release.draft || release.prerelease) {
+    throw new Error("The latest GitHub release has an invalid or unsupported version.");
+  }
+  const installerName = `Capitol-Stock-Management-Setup-${version}.exe`;
+  const installer = release.assets?.find(asset => asset.name === installerName);
+  if (!installer || !Number.isSafeInteger(installer.size) || installer.size <= 0 ||
+      !/^sha256:[a-f0-9]{64}$/i.test(installer.digest || "")) {
+    throw new Error("The latest GitHub release does not have a verified desktop installer.");
+  }
+  return { version, installerName, size: installer.size };
 }
 
 async function checkDesktopUpdate() {
@@ -441,7 +470,7 @@ async function checkDesktopUpdate() {
   if (!current) return;
   const prior = state.desktopUpdate;
   try {
-    const release = await api("/api/app-update/latest");
+    const release = await fetchLatestDesktopRelease();
     const dismissed = localStorage.getItem("capitol-dismissed-update") === release.version;
     if ((current !== "unknown" && compareVersions(current, release.version) >= 0) || dismissed) {
       state.desktopUpdate = null;
@@ -458,11 +487,8 @@ async function checkDesktopUpdate() {
       };
     }
   } catch (error) {
-    if (prior?.version) {
-      state.desktopUpdate = { ...prior, error: error.message };
-    } else {
-      state.desktopUpdate = { current, version: "", phase: "check-error", error: error.message };
-    }
+    console.warn("Desktop version check failed:", error);
+    state.desktopUpdate = prior?.version ? prior : null;
   }
   refreshDesktopUpdateNotice();
 }
