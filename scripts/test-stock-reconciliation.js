@@ -263,9 +263,19 @@ async function run() {
       csrf: session.csrf,
       body: { recipients: ["Room 1"], quantity: 1, requestedBy: bootstrap.waterRequesters[0], issuedBy: "Regression Admin" },
     });
+    assert.ok(bootstrap.waterRequesters.length > 1, "water report test has multiple requesters");
+    const secondWaterIssue = await request(origin, "/api/water/issue", {
+      method: "POST",
+      cookie: session.cookie,
+      csrf: session.csrf,
+      body: { recipients: [bootstrap.waterStaff[0]], quantity: 2, requestedBy: bootstrap.waterRequesters[1], issuedBy: "Second Issuer" },
+    });
+    assert.equal(secondWaterIssue.response.status, 200);
     const dailyWaterReport = await report({ report: "water", type: "daily", date });
-    assert.equal(dailyWaterReport.rows[0]["Requested By"], bootstrap.waterRequesters[0]);
-    assert.equal(dailyWaterReport.rows[0]["Issued By"], "Regression Admin");
+    assert.deepEqual(dailyWaterReport.headers, ["Rooms/ Area", "Quantity In Packs", "Requested By", "Issued By"]);
+    assert.ok(dailyWaterReport.rows.every(row => row["Requested By"] && row["Issued By"]));
+    assert.ok(dailyWaterReport.rows.some(row => row["Requested By"] === bootstrap.waterRequesters[0] && row["Issued By"] === "Regression Admin"));
+    assert.ok(dailyWaterReport.rows.some(row => row["Requested By"] === bootstrap.waterRequesters[1] && row["Issued By"] === "Second Issuer"));
 
     const requests = (await request(origin, "/api/requests", { cookie: session.cookie })).payload;
     assert.equal(requests.rows.length, 2, "current-month requests list every issued item");
@@ -281,8 +291,8 @@ async function run() {
     assert.equal(manifest.display, "standalone");
     assert.deepEqual(manifest.icons.map(icon => icon.sizes), ["192x192", "512x512"]);
     const worker = await request(origin, "/service-worker.js");
-    assert.ok(worker.text.includes("capitol-stock-shell-v3"), "the refreshed PWA shell is installed for mobile clients");
-    assert.equal(bootstrap.appVersion, "1.0.6", "the app exposes its current PC release version");
+    assert.ok(worker.text.includes("capitol-stock-shell-v4"), "the refreshed PWA shell is installed for mobile clients");
+    assert.equal(bootstrap.appVersion, "1.0.7", "the app exposes its current PC release version");
     for (const pathname of ["/assets/capitol-stock-icon-180.png", "/assets/capitol-stock-icon-192.png", "/assets/capitol-stock-icon-512.png"]) {
       const asset = await request(origin, pathname);
       assert.equal(asset.response.status, 200);

@@ -1,13 +1,13 @@
 {
   "name": "capitol-stock-management",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "private": true,
   "description": "Local-first desktop stock, requisition, water tracking and reporting app.",
   "main": "electron-main.js",
   "scripts": {
     "start": "node server.js",
     "import:cloud": "node scripts/import-sqlite-to-postgres.js",
-    "check": "node --check server.js && node --check postgres-adapter.js && node --check postgres-worker.js && node --check app.js && node --check service-worker.js && node --check electron-main.js && node --check scripts/download-node.js && node --check scripts/create-windows-icon.js && node --check scripts/import-sqlite-to-postgres.js && node --check scripts/test-postgres-adapter.js && node scripts/test-stock-reconciliation.js",
+    "check": "node --check server.js && node --check postgres-adapter.js && node --check postgres-worker.js && node --check app.js && node --check release-api.js && node --check preload.js && node --check service-worker.js && node --check electron-main.js && node --check scripts/download-node.js && node --check scripts/create-windows-icon.js && node --check scripts/import-sqlite-to-postgres.js && node --check scripts/test-postgres-adapter.js && node --check scripts/test-release-api.js && node scripts/test-release-api.js && node scripts/test-stock-reconciliation.js",
     "package:win": "npm run check && node scripts/create-windows-icon.js && node scripts/download-node.js && electron-builder --win nsis"
   },
   "engines": {
@@ -32,6 +32,8 @@
     },
     "files": [
       "electron-main.js",
+      "preload.js",
+      "release-api.js",
       "server.js",
       "postgres-adapter.js",
       "postgres-worker.js",

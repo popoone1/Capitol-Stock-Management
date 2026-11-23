@@ -4,6 +4,8 @@ const state = {
   startupProgress: 0,
   startupProgressTimer: null,
   desktopUpdate: null,
+  desktopUpdateTimer: null,
+  desktopUpdateProgressUnsubscribe: null,
   stockAlertOpen: false,
   page: "Dashboard",
   inventory: { items: [], locations: [] },
@@ -327,6 +329,7 @@ async function syncSharedAppearance() {
     if (!refreshed.user) {
       state.bootstrap = refreshed;
       showLogin();
+      refreshDesktopUpdateNotice();
       return;
     }
     if (JSON.stringify(refreshed.appearance) === JSON.stringify(state.bootstrap.appearance)) return;
@@ -359,9 +362,6 @@ function shell(content) {
     if (group) lastGroup = group;
     return `${separator}<button class="nav-item ${state.page === name ? "active" : ""}" data-page="${esc(name)}"><span>${icon}</span>${esc(name)}</button>`;
   }).join("");
-  const desktopUpdateNotice = state.desktopUpdate
-    ? `<aside class="desktop-update-notice" role="status"><span>↻</span><div><strong>PC app update available</strong><small>Installed version ${esc(state.desktopUpdate.current)} · latest version ${esc(state.desktopUpdate.latest)}</small></div><a class="button primary small" href="${esc(state.desktopUpdate.downloadUrl)}" target="_blank" rel="noopener noreferrer">Install latest</a></aside>`
-    : "";
   app.innerHTML = `<div class="app-shell">
     <aside class="sidebar">
       <a href="#" class="brand" data-page="Dashboard"><span class="brand-mark"><img src="/assets/capitol-catering-icon.png" alt="Capitol Catering"></span><span><strong>CAPITOL</strong><small>STOCK MANAGEMENT</small></span></a>
@@ -375,7 +375,7 @@ function shell(content) {
     </aside>
     <main class="main-shell">
       <header class="topbar"><div><div class="breadcrumb"><span>Capitol</span><span>/</span><strong>${esc(state.page)}</strong></div><p>Inventory, requisitions &amp; distribution</p></div><div class="topbar-right">${connectionMarkup()}<button type="button" class="refresh-button" data-action="refresh" aria-label="Refresh current section" title="Refresh current section">↻<span>Refresh</span></button><button type="button" class="theme-toggle" data-action="toggle-theme" aria-label="Switch to ${state.theme === "dark" ? "light" : "dark"} theme" title="Switch theme">${state.theme === "dark" ? "☀" : "☾"}</button><span class="today-chip"><i></i>${prettyDate(dateKey())}</span><span class="avatar" title="${esc(user.displayName)}">${esc(user.displayName.split(/\s+/).slice(0, 2).map(part => part[0]).join("").toUpperCase())}</span><button class="topbar-logout" data-action="logout">Log out</button></div></header>
-      ${desktopUpdateNotice}<section id="page-content" class="page-content">${content}</section>
+      <div id="desktop-update-notice-slot">${desktopUpdateMarkup()}</div><section id="page-content" class="page-content">${content}</section>
       <footer class="footer"><span><i></i> ${state.bootstrap.passwordPolicy === "strong" ? "Shared workspace" : "Private workspace"}</span><span>CAPITOL STOCK MANAGEMENT</span></footer>
     </main>
   </div><div id="modal-root"></div>`;
@@ -393,22 +393,160 @@ function compareVersions(first, second) {
   return 0;
 }
 
-function detectDesktopUpdate(bootstrap) {
+function desktopUpdateMarkup() {
+  const update = state.desktopUpdate;
+  if (!update) return "";
+  if (update.phase === "check-error") {
+    return `<aside class="desktop-update-notice" role="status"><span aria-hidden="true">↻</span><div><strong>Could not check for the latest desktop version</strong><small>${esc(update.error || "Check your connection and try again.")}</small></div><button class="button secondary" type="button" data-action="check-desktop-update">Check again</button></aside>`;
+  }
+  const current = update.current === "unknown" ? "Older desktop build" : `Installed ${esc(update.current)}`;
+  let action = "";
+  if (update.phase === "checking") {
+    action = `<button class="button secondary" type="button" disabled>Checking for updates…</button>`;
+  } else if (update.phase === "downloading") {
+    action = `<div class="desktop-update-download"><button class="button primary" type="button" disabled>Downloading ${esc(update.version)} · ${update.progress}%</button><div class="desktop-update-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${update.progress}"><span style="width:${update.progress}%"></span></div></div>`;
+  } else if (update.phase === "downloaded") {
+    action = `<button class="button primary" type="button" data-action="install-desktop-update">Install ${esc(update.version)} now</button>`;
+  } else if (update.phase === "downloaded-browser") {
+    action = `<strong class="desktop-update-downloaded">Installer downloaded. Open it from Downloads to update this older app.</strong>`;
+  } else {
+    action = `<button class="button primary desktop-update-download-button" type="button" data-action="download-desktop-update">Download ${esc(update.version)}</button>`;
+  }
+  const error = update.error ? `<small class="desktop-update-error">${esc(update.error)}</small>` : "";
+  return `<aside class="desktop-update-notice" role="status"><span aria-hidden="true">↻</span><div><strong>Update available · version ${esc(update.version)}</strong><small>${current} · checking automatically</small>${error}</div>${action}<button class="button secondary small" type="button" data-action="dismiss-desktop-update" aria-label="Ignore this update">Later</button></aside>`;
+}
+
+function refreshDesktopUpdateNotice() {
+  let slot = document.querySelector("#desktop-update-notice-slot");
+  if (!slot && state.desktopUpdate && app.querySelector(".auth-screen")) {
+    slot = document.createElement("div");
+    slot.id = "desktop-update-notice-slot";
+    slot.className = "auth-update-slot";
+    app.prepend(slot);
+  }
+  if (slot) slot.innerHTML = desktopUpdateMarkup();
+}
+
+function detectDesktopUpdate() {
   if (!/Electron\//i.test(navigator.userAgent)) {
     state.desktopUpdate = null;
     return;
   }
   const current = new URLSearchParams(window.location.search).get("desktopVersion") || "unknown";
-  const latest = bootstrap.appVersion;
-  if (!latest || (current !== "unknown" && compareVersions(current, latest) >= 0)) {
-    state.desktopUpdate = null;
-    return;
+  return current;
+}
+
+async function checkDesktopUpdate() {
+  const current = detectDesktopUpdate();
+  if (!current) return;
+  const prior = state.desktopUpdate;
+  try {
+    const release = await api("/api/app-update/latest");
+    const dismissed = localStorage.getItem("capitol-dismissed-update") === release.version;
+    if ((current !== "unknown" && compareVersions(current, release.version) >= 0) || dismissed) {
+      state.desktopUpdate = null;
+    } else {
+      state.desktopUpdate = {
+        current,
+        version: release.version,
+        installerName: release.installerName,
+        size: release.size,
+        phase: prior?.version === release.version && ["downloading", "downloaded", "downloaded-browser"].includes(prior.phase)
+          ? prior.phase
+          : "available",
+        progress: prior?.version === release.version ? prior.progress || 0 : 0,
+      };
+    }
+  } catch (error) {
+    if (prior?.version) {
+      state.desktopUpdate = { ...prior, error: error.message };
+    } else {
+      state.desktopUpdate = { current, version: "", phase: "check-error", error: error.message };
+    }
   }
-  state.desktopUpdate = {
-    current,
-    latest,
-    downloadUrl: "https://github.com/popoone1/Capitol-Stock-Management/releases/latest",
-  };
+  refreshDesktopUpdateNotice();
+}
+
+function startDesktopUpdateMonitor() {
+  if (!/Electron\//i.test(navigator.userAgent) || state.desktopUpdateTimer) return;
+  if (window.capitolUpdater?.onDownloadProgress) {
+    state.desktopUpdateProgressUnsubscribe = window.capitolUpdater.onDownloadProgress(progress => {
+      if (!state.desktopUpdate || progress.version !== state.desktopUpdate.version) return;
+      state.desktopUpdate.phase = "downloading";
+      state.desktopUpdate.progress = progress.percent;
+      refreshDesktopUpdateNotice();
+    });
+  }
+  void checkDesktopUpdate();
+  state.desktopUpdateTimer = window.setInterval(() => { void checkDesktopUpdate(); }, 10 * 60 * 1000);
+}
+
+async function downloadDesktopUpdate() {
+  if (!state.desktopUpdate?.version) return;
+  const update = state.desktopUpdate;
+  update.phase = "downloading";
+  update.progress = 0;
+  update.error = "";
+  refreshDesktopUpdateNotice();
+  try {
+    if (window.capitolUpdater?.downloadLatest) {
+      await window.capitolUpdater.downloadLatest();
+      update.phase = "downloaded";
+      update.progress = 100;
+      refreshDesktopUpdateNotice();
+      toast(`Version ${update.version} is downloaded and verified. Install it when ready.`);
+      return;
+    }
+
+    const response = await fetch("/api/app-update/download", { credentials: "same-origin" });
+    if (!response.ok || !response.body) {
+      let message = `Installer download failed (${response.status}).`;
+      try { message = (await response.json()).error || message; } catch {}
+      throw new Error(message);
+    }
+    const total = Number(response.headers.get("content-length")) || update.size;
+    const reader = response.body.getReader();
+    const chunks = [];
+    let downloaded = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      downloaded += value.byteLength;
+      const progress = Math.min(99, Math.floor(downloaded / total * 100));
+      if (progress > update.progress) {
+        update.progress = progress;
+        refreshDesktopUpdateNotice();
+      }
+    }
+    if (downloaded !== total) throw new Error("The installer download was incomplete. Please retry.");
+    const installer = new Blob(chunks, { type: "application/octet-stream" });
+    const url = URL.createObjectURL(installer);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = update.installerName;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    update.phase = "downloaded-browser";
+    update.progress = 100;
+    refreshDesktopUpdateNotice();
+    toast("Installer downloaded. Open it from Downloads to update this older desktop app.");
+  } catch (error) {
+    update.phase = "available";
+    update.error = error.message;
+    refreshDesktopUpdateNotice();
+    toast(error.message, true);
+  }
+}
+
+async function installDesktopUpdate() {
+  if (!state.desktopUpdate || !window.capitolUpdater?.installLatest) return;
+  if (!window.confirm(`Install version ${state.desktopUpdate.version} now? The app will close and the installer will start.`)) return;
+  try {
+    await window.capitolUpdater.installLatest();
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 function pageHeading(kicker, title, description, actions = "") {
@@ -445,7 +583,7 @@ function renderDashboard(data) {
     state.bootstrap.user.role === "user" ? button("Create requisition →", "go-issue", { primary: true }) :
       `<button class="button primary" data-page="Auditor">Open auditor workspace →</button>`;
   const alertItems = data.stockAlertItems || [];
-  const alertTable = state.stockAlertOpen ? `<section class="card stock-alert-list"><div class="panel-heading"><div><span class="section-label">STOCK NEEDING ATTENTION</span><h2>Low and out-of-stock items</h2></div><span class="count-chip">${alertItems.length} items</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>SKU</th><th>STORE</th><th>ITEM</th><th>REMAINDER</th></tr></thead><tbody>${alertItems.map(item => `<tr><td><span class="sku">${esc(item.sku)}</span></td><td>${esc(item.store)}</td><td><strong>${esc(item.item)}</strong></td><td>${number(item.remainder)}</td></tr>`).join("") || `<tr><td colspan="4">No low or out-of-stock items.</td></tr>`}</tbody></table></div></section>` : "";
+  const alertTable = state.stockAlertOpen ? `<section class="card stock-alert-list"><div class="panel-heading"><div><span class="section-label">STOCK NEEDING ATTENTION</span><h2>Low and out-of-stock items</h2></div><div class="stock-alert-actions"><span class="count-chip">${alertItems.length} items</span>${alertItems.length ? `<button class="button secondary small" type="button" data-action="print-stock-alerts">Print</button><button class="button secondary small" type="button" data-action="save-stock-alerts">Save CSV</button>` : ""}</div></div><div class="table-scroll"><table class="data-table"><thead><tr><th>SKU</th><th>STORE</th><th>ITEM</th><th>REMAINDER</th></tr></thead><tbody>${alertItems.map(item => `<tr><td><span class="sku">${esc(item.sku)}</span></td><td>${esc(item.store)}</td><td><strong>${esc(item.item)}</strong></td><td>${number(item.remainder)}</td></tr>`).join("") || `<tr><td colspan="4">No low or out-of-stock items.</td></tr>`}</tbody></table></div></section>` : "";
   return `${pageHeading("STORE OVERVIEW", `Good morning, ${esc(firstName)}`, "Here’s the stock and activity at your stores today.", action)}
     <section class="stat-grid">${stat("ACTIVE ITEMS", number(data.totalItems, 0), "Across all stock categories", "▦")}${stat("STOCK ON HAND", number(data.totalUnits), "Total quantity in item units", "◈", "mint")}${stat("LOW / OUT OF STOCK", `${data.lowStock} / ${data.outOfStock}`, "Click to view affected items", "!", "amber", "toggle-stock-alerts", state.stockAlertOpen)}${stat("ISSUED TODAY", number(data.stockIssuedToday, 0), `${data.waterIssuedToday} water locations served`, "↗", "blue")}</section>${alertTable}
     <section class="dashboard-grid">
@@ -1032,11 +1170,12 @@ async function refreshCurrentPage() {
   const inventorySection = state.inventorySection;
   const refreshed = await api("/api/bootstrap");
   state.bootstrap = { ...state.bootstrap, ...refreshed };
-  detectDesktopUpdate(state.bootstrap);
+  void checkDesktopUpdate();
   state.appearanceDraft = null;
   applyAppearance();
   if (!state.bootstrap.user) {
     showLogin();
+    refreshDesktopUpdateNotice();
     return true;
   }
   const loaded = await navigate(state.page);
@@ -1068,17 +1207,19 @@ async function initialize() {
   startConnectionMonitor();
   try {
     state.bootstrap = await api("/api/bootstrap");
-    detectDesktopUpdate(state.bootstrap);
+    startDesktopUpdateMonitor();
     state.appearanceDraft = null;
     applyAppearance();
     if (state.bootstrap.setupRequired) {
       await completeStartupProgress();
       state.startupLoading = false;
       showSetup();
+      refreshDesktopUpdateNotice();
     } else if (!state.bootstrap.user) {
       await completeStartupProgress();
       state.startupLoading = false;
       showLogin();
+      refreshDesktopUpdateNotice();
     }
     else await navigate("Dashboard");
   } catch (error) {
@@ -1263,7 +1404,40 @@ function saveCsv(report) {
   link.href = url;
   link.download = `${report.type}-report-${report.from}-to-${report.to}.csv`;
   link.click();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+function saveStockAlertCsv() {
+  const rows = state.dashboard?.stockAlertItems || [];
+  if (!rows.length) return toast("There are no low or out-of-stock items to save.", true);
+  saveCsv({
+    type: "low-out-of-stock",
+    from: dateKey(),
+    to: dateKey(),
+    headers: ["SKU", "Store", "Item", "Remainder"],
+    rows: rows.map(item => ({
+      SKU: item.sku,
+      Store: item.store,
+      Item: item.item,
+      Remainder: item.remainder,
+    })),
+  });
+}
+
+function printStockAlerts() {
+  if (!state.dashboard?.stockAlertItems?.length) return toast("There are no low or out-of-stock items to print.", true);
+  const clearPrintMode = () => {
+    delete app.dataset.printMode;
+    window.removeEventListener("afterprint", clearPrintMode);
+  };
+  app.dataset.printMode = "stock-alerts";
+  window.addEventListener("afterprint", clearPrintMode, { once: true });
+  try {
+    window.print();
+  } catch (error) {
+    clearPrintMode();
+    toast(`Could not open the print dialog. ${error.message}`, true);
+  }
 }
 
 async function reloadAdmin() {
@@ -1301,6 +1475,32 @@ document.addEventListener("click", async event => {
   const target = event.target.closest("button, a");
   if (!target) {
     if (event.target.classList?.contains("modal-backdrop")) closeModal();
+    return;
+  }
+  if (target.dataset.action === "check-desktop-update") {
+    await checkDesktopUpdate();
+    return;
+  }
+  if (target.dataset.action === "download-desktop-update") {
+    await downloadDesktopUpdate();
+    return;
+  }
+  if (target.dataset.action === "install-desktop-update") {
+    await installDesktopUpdate();
+    return;
+  }
+  if (target.dataset.action === "dismiss-desktop-update") {
+    if (state.desktopUpdate?.version) localStorage.setItem("capitol-dismissed-update", state.desktopUpdate.version);
+    state.desktopUpdate = null;
+    refreshDesktopUpdateNotice();
+    return;
+  }
+  if (target.dataset.action === "save-stock-alerts") {
+    saveStockAlertCsv();
+    return;
+  }
+  if (target.dataset.action === "print-stock-alerts") {
+    printStockAlerts();
     return;
   }
   if (target.dataset.inventoryArchive) {
@@ -1400,6 +1600,7 @@ document.addEventListener("click", async event => {
       state.bootstrap.user = null;
       state.bootstrap.csrfToken = null;
       showLogin();
+      refreshDesktopUpdateNotice();
     } catch (error) { toast(error.message, true); }
     finally { if (target.isConnected) setLoading(target, false); }
   } else if (target.dataset.action === "refresh") {
@@ -1918,6 +2119,7 @@ document.addEventListener("submit", async event => {
       toast("Administrator created. Sign in with your new account.");
       state.bootstrap = await api("/api/bootstrap");
       showLogin();
+      refreshDesktopUpdateNotice();
     } catch (error) { toast(error.message, true); }
     finally { setLoading(submit, false); }
   } else if (form.id === "login-form") {

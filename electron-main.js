@@ -1,8 +1,12 @@
-const { app, BrowserWindow, dialog } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
+const { Readable, Transform } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
+const { compareVersions, getLatestRelease } = require("./release-api");
 
 const PRODUCT_NAME = "Capitol Stock Management";
 app.setName(PRODUCT_NAME);
@@ -21,6 +25,134 @@ let serverProcess;
 let serverLog;
 let mainWindow;
 let quitting = false;
+let localServerPort = null;
+let activeUpdateDownload = null;
+let downloadedUpdate = null;
+
+function assertTrustedRenderer(event) {
+  if (!mainWindow || mainWindow.isDestroyed() ||
+      event.sender !== mainWindow.webContents ||
+      event.senderFrame !== mainWindow.webContents.mainFrame) {
+    throw new Error("Desktop updates can only be requested by the Capitol application window.");
+  }
+  const rendererUrl = new URL(event.senderFrame.url);
+  const trustedOrigin = REMOTE_APP_URL
+    ? new URL(REMOTE_APP_URL).origin
+    : `http://127.0.0.1:${localServerPort}`;
+  if (rendererUrl.origin !== trustedOrigin) {
+    throw new Error("Desktop updates are unavailable from an untrusted page.");
+  }
+}
+
+function reportUpdateProgress(event, progress) {
+  if (!event.sender.isDestroyed()) event.sender.send("app-update:progress", progress);
+}
+
+async function downloadLatestInstaller(event) {
+  if (activeUpdateDownload) return activeUpdateDownload;
+  activeUpdateDownload = (async () => {
+    const release = await getLatestRelease();
+    if (compareVersions(release.version, app.getVersion()) <= 0) {
+      throw new Error("This desktop app is already on the latest release.");
+    }
+    const response = await fetch(release.downloadUrl, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(30 * 60 * 1000),
+    });
+    const finalUrl = new URL(response.url);
+    if (!response.ok || !response.body ||
+        finalUrl.protocol !== "https:" ||
+        !(finalUrl.hostname === "github.com" || finalUrl.hostname.endsWith(".githubusercontent.com"))) {
+      throw new Error("GitHub did not provide the desktop installer.");
+    }
+
+    const updateDirectory = path.join(APP_DATA, "updates");
+    const installerPath = path.join(updateDirectory, release.installerName);
+    const partialPath = `${installerPath}.partial`;
+    fs.mkdirSync(updateDirectory, { recursive: true });
+    await fs.promises.rm(partialPath, { force: true });
+
+    const hash = crypto.createHash("sha256");
+    let downloadedBytes = 0;
+    let lastProgressAt = 0;
+    const meter = new Transform({
+      transform(chunk, _encoding, callback) {
+        downloadedBytes += chunk.length;
+        hash.update(chunk);
+        const now = Date.now();
+        if (now - lastProgressAt >= 120 || downloadedBytes === release.size) {
+          lastProgressAt = now;
+          reportUpdateProgress(event, {
+            version: release.version,
+            downloadedBytes,
+            totalBytes: release.size,
+            percent: Math.min(99, Math.floor((downloadedBytes / release.size) * 100)),
+          });
+        }
+        callback(null, chunk);
+      },
+    });
+
+    try {
+      await pipeline(
+        Readable.fromWeb(response.body),
+        meter,
+        fs.createWriteStream(partialPath, { flags: "wx" }),
+      );
+      const actualDigest = `sha256:${hash.digest("hex")}`;
+      if (downloadedBytes !== release.size || actualDigest !== release.digest) {
+        throw new Error("The downloaded installer failed its GitHub size or SHA-256 verification.");
+      }
+      await fs.promises.rm(installerPath, { force: true });
+      await fs.promises.rename(partialPath, installerPath);
+      downloadedUpdate = { installerPath, version: release.version };
+      reportUpdateProgress(event, {
+        version: release.version,
+        downloadedBytes,
+        totalBytes: release.size,
+        percent: 100,
+      });
+      return { downloaded: true, version: release.version };
+    } catch (error) {
+      await fs.promises.rm(partialPath, { force: true });
+      throw error;
+    }
+  })();
+
+  try {
+    return await activeUpdateDownload;
+  } finally {
+    activeUpdateDownload = null;
+  }
+}
+
+ipcMain.handle("app-update:download", async event => {
+  assertTrustedRenderer(event);
+  return downloadLatestInstaller(event);
+});
+
+ipcMain.handle("app-update:install", async event => {
+  assertTrustedRenderer(event);
+  if (!downloadedUpdate || !fs.existsSync(downloadedUpdate.installerPath)) {
+    throw new Error("Download the verified installer before starting the update.");
+  }
+  if (compareVersions(downloadedUpdate.version, app.getVersion()) <= 0) {
+    throw new Error("The downloaded installer is not newer than this app.");
+  }
+
+  const installer = spawn(downloadedUpdate.installerPath, [], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: false,
+  });
+  installer.unref();
+  await new Promise((resolve, reject) => {
+    installer.once("spawn", resolve);
+    installer.once("error", reject);
+  });
+  app.quit();
+  return { started: true };
+});
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -109,6 +241,7 @@ function createWindow(url) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      preload: path.join(app.getAppPath(), "preload.js"),
     },
   });
   mainWindow.once("ready-to-show", () => mainWindow.show());
@@ -136,6 +269,7 @@ app.whenReady().then(async () => {
       return;
     }
     const port = await startServer();
+    localServerPort = port;
     createWindow(`http://127.0.0.1:${port}`);
   } catch (error) {
     dialog.showErrorBox(PRODUCT_NAME, `Capitol Stock Management could not start.\n\n${error.message}`);

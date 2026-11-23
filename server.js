@@ -2,8 +2,11 @@ const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { Readable } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
 const { DatabaseSync } = require("node:sqlite");
 const { PostgresDatabase } = require("./postgres-adapter");
+const { getLatestRelease } = require("./release-api");
 
 const ROOT = __dirname;
 const DATA_DIR = process.env.CAPITOL_DATA_DIR || path.join(ROOT, "data");
@@ -2314,8 +2317,9 @@ function waterReport(body) {
   }
   const records = db.prepare(`
     SELECT date AS date, recipient AS recipient, quantity,
-      COALESCE(NULLIF(TRIM(requested_by), ''), NULLIF(TRIM(created_by), ''), 'Unknown') AS requestedBy,
-      COALESCE(NULLIF(TRIM(issued_by), ''), NULLIF(TRIM(created_by), ''), 'Unknown') AS issuedBy,
+      -- Keep the JavaScript key casing consistent across SQLite and PostgreSQL.
+      COALESCE(NULLIF(TRIM(requested_by), ''), NULLIF(TRIM(created_by), ''), 'Unknown') AS "requestedBy",
+      COALESCE(NULLIF(TRIM(issued_by), ''), NULLIF(TRIM(created_by), ''), 'Unknown') AS "issuedBy",
       created_by AS createdBy
     FROM water_records WHERE date >= ? AND date <= ? ORDER BY date, recipient COLLATE NOCASE, created_at
   `).all(from, to);
@@ -2330,8 +2334,8 @@ function waterReport(body) {
       rows: records.map(record => ({
         "Rooms/ Area": record.recipient,
         "Quantity In Packs": record.quantity,
-        "Requested By": record.requestedBy,
-        "Issued By": record.issuedBy,
+        "Requested By": record.requestedBy || "Unknown",
+        "Issued By": record.issuedBy || "Unknown",
       })),
     };
   }
@@ -2636,7 +2640,7 @@ function asyncRoute(handler) {
       if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) ensureSameOrigin(request);
       assertBodyObject(body);
       const result = await handler(request, response, body, session);
-      if (response.writableEnded) return;
+      if (response.headersSent || response.writableEnded) return;
       sendJson(response, result?.statusCode || 200, result?.body ?? result);
     } catch (error) {
       const status = error.statusCode || (usePostgres && error.code === "23505" ? 409 : 500);
@@ -2647,6 +2651,7 @@ function asyncRoute(handler) {
           ? "A server error occurred. Please try again or contact an administrator."
           : error.message;
       if (!response.headersSent && !response.destroyed) sendJson(response, status, { error: message });
+      else if (!response.destroyed) response.destroy(error);
     }
   };
 }
@@ -2659,6 +2664,50 @@ function route(method, pathname, handler) {
 route("GET", "/api/bootstrap", request => {
   ensurePreviousMonthInventoryArchive();
   return publicBootstrap(request);
+});
+route("GET", "/api/app-update/latest", async () => {
+  try {
+    const release = await getLatestRelease();
+    return {
+      version: release.version,
+      installerName: release.installerName,
+      size: release.size,
+      digest: release.digest,
+      releaseUrl: release.releaseUrl,
+    };
+  } catch (error) {
+    console.error("Desktop update check failed:", error.message);
+    throw httpError(503, "The latest desktop release could not be checked. Try again shortly.");
+  }
+});
+route("GET", "/api/app-update/download", async (_request, response) => {
+  let release;
+  try {
+    release = await getLatestRelease();
+  } catch (error) {
+    console.error("Desktop installer lookup failed:", error.message);
+    throw httpError(503, "The latest desktop installer could not be found. Try again shortly.");
+  }
+  const installerResponse = await fetch(release.downloadUrl, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(30 * 60 * 1000),
+  });
+  const finalUrl = new URL(installerResponse.url);
+  const contentLength = installerResponse.headers.get("content-length");
+  if (!installerResponse.ok || !installerResponse.body ||
+      finalUrl.protocol !== "https:" ||
+      !(finalUrl.hostname === "github.com" || finalUrl.hostname.endsWith(".githubusercontent.com")) ||
+      (contentLength && Number(contentLength) !== release.size)) {
+    throw httpError(502, "GitHub did not provide the desktop installer.");
+  }
+  response.writeHead(200, {
+    "Content-Type": "application/octet-stream",
+    "Content-Disposition": `attachment; filename="${release.installerName}"`,
+    "Content-Length": String(release.size),
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+  });
+  await pipeline(Readable.fromWeb(installerResponse.body), response);
 });
 route("POST", "/api/setup", (_request, _response, body) => {
   if (db.prepare("SELECT 1 AS found FROM users LIMIT 1").get()) throw httpError(409, "Initial setup is already complete. Sign in instead.");

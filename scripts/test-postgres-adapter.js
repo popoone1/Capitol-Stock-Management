@@ -14,6 +14,10 @@ assert.equal(
   "SELECT '?' AS literal, $1 AS value -- ? stays a comment",
 );
 assert.equal(
+  translateSql('SELECT COALESCE(requested_by, created_by) AS "requestedBy" FROM water_records'),
+  'SELECT COALESCE(requested_by, created_by) AS "requestedBy" FROM water_records',
+);
+assert.equal(
   translateSql("INSERT OR IGNORE INTO categories (id, name) VALUES (?, ?);"),
   "INSERT INTO categories (id, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
 );

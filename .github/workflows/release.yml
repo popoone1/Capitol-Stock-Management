@@ -1,0 +1,46 @@
+name: Windows desktop release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: npm
+
+      - name: Build Windows installer
+        run: |
+          npm ci
+          npm run package:win
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $packageVersion = (Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json).version
+          if ($version -ne $packageVersion) {
+            throw "Release tag $version does not match package version $packageVersion."
+          }
+          $installer = "dist/Capitol-Stock-Management-Setup-$version.exe"
+          if (-not (Test-Path -LiteralPath $installer)) {
+            throw "Expected installer was not created: $installer"
+          }
+          gh release create $env:GITHUB_REF_NAME $installer `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "Capitol Stock Management $version" `
+            --generate-notes
