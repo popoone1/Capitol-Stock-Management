@@ -1,6 +1,6 @@
 {
   "name": "capitol-stock-management",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": true,
   "description": "Local-first desktop stock, requisition, water tracking and reporting app.",
   "main": "electron-main.js",

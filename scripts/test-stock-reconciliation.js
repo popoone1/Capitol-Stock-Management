@@ -138,6 +138,17 @@ async function run() {
       initialQuantity: 13,
       locationId: frozen.id,
     });
+    const emptyItem = await createItem({
+      sku: "CHE021",
+      name: "Out of stock test item",
+      category: "Chemical",
+      store: "Chemical Store",
+      unit: "pieces",
+      reorderLevel: 1,
+      receivedStockQuantity: 0,
+      initialQuantity: 0,
+      locationId: chemical.id,
+    });
     await stopServer();
 
     const localDb = new DatabaseSync(databasePath);
@@ -191,19 +202,73 @@ async function run() {
         person: "Togbe",
         issuedBy: "Regression Admin",
         date,
-        lines: [{ itemId: hairnet.id, locationId: chemical.id, quantity: 2 }],
+        lines: [
+          { itemId: hairnet.id, locationId: chemical.id, quantity: 2 },
+          { itemId: fish.id, locationId: frozen.id, quantity: 1 },
+        ],
       },
     });
+    const reportDb = new DatabaseSync(databasePath);
+    try {
+      reportDb.prepare(`
+        UPDATE stock_transactions SET request_group_id = 'shared-multi-item-requisition'
+        WHERE item_id IN (?, ?) AND request_date = ? AND quantity < 0 AND kind IN ('requisition', 'issue')
+      `).run(hairnet.id, fish.id, date);
+    } finally {
+      reportDb.close();
+    }
     const updatedInventory = (await request(origin, "/api/inventory", { cookie: session.cookie })).payload;
     const updatedIssueItems = (await request(origin, `/api/items?locationId=${encodeURIComponent(chemical.id)}`, {
       cookie: session.cookie,
     })).payload.items;
     assert.equal(updatedInventory.items.find(row => row.id === hairnet.id).remainder, 9);
     assert.equal(updatedIssueItems.find(row => row.id === hairnet.id).on_hand, 9);
+    const dashboard = (await request(origin, "/api/dashboard", { cookie: session.cookie })).payload;
+    assert.ok(dashboard.stockAlertItems.some(item => item.sku === emptyItem.sku && item.store === "Chemical Store" && item.remainder === 0));
+
+    const report = async body => (await request(origin, "/api/reports", {
+      method: "POST",
+      cookie: session.cookie,
+      csrf: session.csrf,
+      body,
+    })).payload;
+    const dailyRequisitions = await report({ report: "stock", reportKind: "requisition", type: "daily", date });
+    assert.equal(dailyRequisitions.rows.length, 2, "a shared request group retains every requisition item");
+    assert.deepEqual(new Set(dailyRequisitions.rows.map(row => row.Item)), new Set(["Hairnet", "Fish fillet"]));
+    const chemicalRequisitions = await report({ report: "stock", reportKind: "requisition", type: "daily", date, store: "Chemical Store" });
+    assert.deepEqual(chemicalRequisitions.rows.map(row => row.Item), ["Hairnet"]);
+    const frozenRequisitions = await report({ report: "stock", reportKind: "requisition", type: "daily", date, store: "Frozen Store" });
+    assert.deepEqual(frozenRequisitions.rows.map(row => row.Item), ["Fish fillet"]);
+    assert.equal((await report({ report: "stock", reportKind: "requisition", type: "range", from: date, to: date })).rows.length, 2);
+    assert.equal((await report({ report: "stock", reportKind: "requisition", type: "monthly", month: date.slice(0, 7) })).rows.length, 2);
+    assert.equal((await report({ report: "stock", reportKind: "entries", type: "daily", date })).rows.length, 2);
+    assert.equal((await report({ report: "stock", reportKind: "movements", type: "daily", date })).rows.length, 4);
+    const updates = await report({ report: "stock", reportKind: "updates", store: "Chemical Store" });
+    assert.equal(updates.rows.length, 2, "stock updates include every catalog item in the selected store");
+
+    const cooldownRooms = bootstrap.waterRooms.filter(room => room !== "Room 1");
+    const exemptRooms = ["Room 28", "Room 29", "Room 30", "Room 31", "Room 32", "Room 36", "Room 38", "Room 39", "Room 1"];
+    const waterRuleResponse = await request(origin, "/api/admin/water-rules", {
+      method: "PUT",
+      cookie: session.cookie,
+      csrf: session.csrf,
+      body: { cooldownRooms, exemptRooms },
+    });
+    assert.ok(waterRuleResponse.payload.waterRules.exemptRooms.includes("Room 1"));
+    let water = (await request(origin, "/api/water", { cookie: session.cookie })).payload;
+    assert.ok(water.recipients.find(recipient => recipient.recipient === "Room 1").dailyAllowed);
+    await request(origin, "/api/water/issue", {
+      method: "POST",
+      cookie: session.cookie,
+      csrf: session.csrf,
+      body: { recipients: ["Room 1"], quantity: 1, requestedBy: bootstrap.waterRequesters[0], issuedBy: "Regression Admin" },
+    });
+    const dailyWaterReport = await report({ report: "water", type: "daily", date });
+    assert.equal(dailyWaterReport.rows[0]["Requested By"], bootstrap.waterRequesters[0]);
+    assert.equal(dailyWaterReport.rows[0]["Issued By"], "Regression Admin");
 
     const requests = (await request(origin, "/api/requests", { cookie: session.cookie })).payload;
-    assert.equal(requests.rows.length, 1, "current-month requests are listed");
-    assert.equal(requests.rows[0].quantity_requested, 2);
+    assert.equal(requests.rows.length, 2, "current-month requests list every issued item");
     const archives = (await request(origin, "/api/requests/archives", { cookie: session.cookie })).payload.archives;
     assert.ok(archives.length > 0, "a completed-month request archive is created");
     assert.ok(archives[0].stores.includes("Chemical Store"));
@@ -211,12 +276,13 @@ async function run() {
 
     const shell = await request(origin, "/");
     assert.ok(shell.text.includes('class="boot-screen"'), "the PWA starts with a visible workspace splash");
-    assert.ok(shell.text.includes("Fetching live inventory and account details"), "the splash communicates live startup loading");
+    assert.ok(shell.text.includes("Loading the latest live workspace and inventory"), "the splash communicates live startup loading");
     const manifest = (await request(origin, "/manifest.json")).payload;
     assert.equal(manifest.display, "standalone");
     assert.deepEqual(manifest.icons.map(icon => icon.sizes), ["192x192", "512x512"]);
     const worker = await request(origin, "/service-worker.js");
-    assert.ok(worker.text.includes("capitol-stock-shell-v2"), "the refreshed PWA shell is installed for mobile clients");
+    assert.ok(worker.text.includes("capitol-stock-shell-v3"), "the refreshed PWA shell is installed for mobile clients");
+    assert.equal(bootstrap.appVersion, "1.0.6", "the app exposes its current PC release version");
     for (const pathname of ["/assets/capitol-stock-icon-180.png", "/assets/capitol-stock-icon-192.png", "/assets/capitol-stock-icon-512.png"]) {
       const asset = await request(origin, pathname);
       assert.equal(asset.response.status, 200);
@@ -234,8 +300,10 @@ async function run() {
       cookie: session.cookie,
     })).payload.items;
     assert.equal(restartedItems.find(row => row.id === hairnet.id).on_hand, 9, "reconciliation is idempotent after issuing stock");
-    assert.equal(restartedFrozenItems.find(row => row.id === fish.id).on_hand, 13, "other store balances remain aligned after restart");
-    console.log("Cross-store stock reconciliation, monthly request archives and PWA checks passed.");
+    assert.equal(restartedFrozenItems.find(row => row.id === fish.id).on_hand, 12, "other store balances remain aligned after restart");
+    water = (await request(origin, "/api/water", { cookie: session.cookie })).payload;
+    assert.ok(water.rules.exemptRooms.includes("Room 1"), "water rule edits persist after restart");
+    console.log("Stock reports, water reports/rules, dashboard alerts, version metadata and PWA checks passed.");
   } finally {
     await stopServer();
     fs.rmSync(tempDir, { recursive: true, force: true });

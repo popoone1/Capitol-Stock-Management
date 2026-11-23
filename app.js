@@ -1,6 +1,10 @@
 const state = {
   bootstrap: null,
   startupLoading: false,
+  startupProgress: 0,
+  startupProgressTimer: null,
+  desktopUpdate: null,
+  stockAlertOpen: false,
   page: "Dashboard",
   inventory: { items: [], locations: [] },
   inventoryArchives: [],
@@ -35,7 +39,6 @@ const state = {
 
 const app = document.querySelector("#app");
 const toastRegion = document.querySelector("#toast-region");
-const WATER_EXEMPT = new Set([28, 29, 30, 31, 32, 36, 38, 39].map(room => `Room ${room}`));
 const APPEARANCE_FONTS = {
   inter: "Inter",
   manrope: "Manrope",
@@ -356,6 +359,9 @@ function shell(content) {
     if (group) lastGroup = group;
     return `${separator}<button class="nav-item ${state.page === name ? "active" : ""}" data-page="${esc(name)}"><span>${icon}</span>${esc(name)}</button>`;
   }).join("");
+  const desktopUpdateNotice = state.desktopUpdate
+    ? `<aside class="desktop-update-notice" role="status"><span>↻</span><div><strong>PC app update available</strong><small>Installed version ${esc(state.desktopUpdate.current)} · latest version ${esc(state.desktopUpdate.latest)}</small></div><a class="button primary small" href="${esc(state.desktopUpdate.downloadUrl)}" target="_blank" rel="noopener noreferrer">Install latest</a></aside>`
+    : "";
   app.innerHTML = `<div class="app-shell">
     <aside class="sidebar">
       <a href="#" class="brand" data-page="Dashboard"><span class="brand-mark"><img src="/assets/capitol-catering-icon.png" alt="Capitol Catering"></span><span><strong>CAPITOL</strong><small>STOCK MANAGEMENT</small></span></a>
@@ -369,7 +375,7 @@ function shell(content) {
     </aside>
     <main class="main-shell">
       <header class="topbar"><div><div class="breadcrumb"><span>Capitol</span><span>/</span><strong>${esc(state.page)}</strong></div><p>Inventory, requisitions &amp; distribution</p></div><div class="topbar-right">${connectionMarkup()}<button type="button" class="refresh-button" data-action="refresh" aria-label="Refresh current section" title="Refresh current section">↻<span>Refresh</span></button><button type="button" class="theme-toggle" data-action="toggle-theme" aria-label="Switch to ${state.theme === "dark" ? "light" : "dark"} theme" title="Switch theme">${state.theme === "dark" ? "☀" : "☾"}</button><span class="today-chip"><i></i>${prettyDate(dateKey())}</span><span class="avatar" title="${esc(user.displayName)}">${esc(user.displayName.split(/\s+/).slice(0, 2).map(part => part[0]).join("").toUpperCase())}</span><button class="topbar-logout" data-action="logout">Log out</button></div></header>
-      <section id="page-content" class="page-content">${content}</section>
+      ${desktopUpdateNotice}<section id="page-content" class="page-content">${content}</section>
       <footer class="footer"><span><i></i> ${state.bootstrap.passwordPolicy === "strong" ? "Shared workspace" : "Private workspace"}</span><span>CAPITOL STOCK MANAGEMENT</span></footer>
     </main>
   </div><div id="modal-root"></div>`;
@@ -377,12 +383,42 @@ function shell(content) {
   if (state.page === "Admin" && state.adminSection === "Appearance") updateAppearancePreview();
 }
 
+function compareVersions(first, second) {
+  const left = String(first).replace(/^v/i, "").split(".").map(part => Number.parseInt(part, 10) || 0);
+  const right = String(second).replace(/^v/i, "").split(".").map(part => Number.parseInt(part, 10) || 0);
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] || 0) - (right[index] || 0);
+    if (difference) return Math.sign(difference);
+  }
+  return 0;
+}
+
+function detectDesktopUpdate(bootstrap) {
+  if (!/Electron\//i.test(navigator.userAgent)) {
+    state.desktopUpdate = null;
+    return;
+  }
+  const current = new URLSearchParams(window.location.search).get("desktopVersion") || "unknown";
+  const latest = bootstrap.appVersion;
+  if (!latest || (current !== "unknown" && compareVersions(current, latest) >= 0)) {
+    state.desktopUpdate = null;
+    return;
+  }
+  state.desktopUpdate = {
+    current,
+    latest,
+    downloadUrl: "https://github.com/popoone1/Capitol-Stock-Management/releases/latest",
+  };
+}
+
 function pageHeading(kicker, title, description, actions = "") {
   return `<div class="page-heading"><div><span class="eyebrow">${kicker}</span><h1>${title}</h1><p>${description}</p></div><div class="page-actions">${actions}</div></div>`;
 }
 
-function stat(label, value, caption, icon, tone = "") {
-  return `<article class="card stat-card ${tone}"><div class="stat-top"><span>${label}</span><i>${icon}</i></div><strong>${value}</strong><small>${caption}</small></article>`;
+function stat(label, value, caption, icon, tone = "", action = "", expanded = false) {
+  const tag = action ? "button" : "article";
+  const attrs = action ? `type="button" data-action="${action}" aria-expanded="${expanded}"` : "";
+  return `<${tag} class="card stat-card ${tone}${action ? " clickable-stat" : ""}" ${attrs}><div class="stat-top"><span>${label}</span><i>${icon}</i></div><strong>${value}</strong><small>${caption}</small></${tag}>`;
 }
 
 function statusPill(status) {
@@ -408,8 +444,10 @@ function renderDashboard(data) {
   const action = state.bootstrap.user.role === "admin" ? button("＋ Add item", "new-item", { primary: true }) :
     state.bootstrap.user.role === "user" ? button("Create requisition →", "go-issue", { primary: true }) :
       `<button class="button primary" data-page="Auditor">Open auditor workspace →</button>`;
+  const alertItems = data.stockAlertItems || [];
+  const alertTable = state.stockAlertOpen ? `<section class="card stock-alert-list"><div class="panel-heading"><div><span class="section-label">STOCK NEEDING ATTENTION</span><h2>Low and out-of-stock items</h2></div><span class="count-chip">${alertItems.length} items</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>SKU</th><th>STORE</th><th>ITEM</th><th>REMAINDER</th></tr></thead><tbody>${alertItems.map(item => `<tr><td><span class="sku">${esc(item.sku)}</span></td><td>${esc(item.store)}</td><td><strong>${esc(item.item)}</strong></td><td>${number(item.remainder)}</td></tr>`).join("") || `<tr><td colspan="4">No low or out-of-stock items.</td></tr>`}</tbody></table></div></section>` : "";
   return `${pageHeading("STORE OVERVIEW", `Good morning, ${esc(firstName)}`, "Here’s the stock and activity at your stores today.", action)}
-    <section class="stat-grid">${stat("ACTIVE ITEMS", number(data.totalItems, 0), "Across all stock categories", "▦")}${stat("STOCK ON HAND", number(data.totalUnits), "Total quantity in item units", "◈", "mint")}${stat("LOW / OUT OF STOCK", `${data.lowStock} / ${data.outOfStock}`, "Items at or below reorder level", "!", "amber")}${stat("ISSUED TODAY", number(data.stockIssuedToday, 0), `${data.waterIssuedToday} water locations served`, "↗", "blue")}</section>
+    <section class="stat-grid">${stat("ACTIVE ITEMS", number(data.totalItems, 0), "Across all stock categories", "▦")}${stat("STOCK ON HAND", number(data.totalUnits), "Total quantity in item units", "◈", "mint")}${stat("LOW / OUT OF STOCK", `${data.lowStock} / ${data.outOfStock}`, "Click to view affected items", "!", "amber", "toggle-stock-alerts", state.stockAlertOpen)}${stat("ISSUED TODAY", number(data.stockIssuedToday, 0), `${data.waterIssuedToday} water locations served`, "↗", "blue")}</section>${alertTable}
     <section class="dashboard-grid">
       <article class="card panel-card category-panel"><div class="panel-heading"><div><span class="section-label">INVENTORY MIX</span><h2>Stock by category</h2></div><button class="link-button" data-page="Inventory">View inventory →</button></div><div class="category-list">${bars}</div><div class="category-foot"><span>Items are totalled across active store locations.</span></div></article>
       <article class="card panel-card alert-panel"><div class="panel-heading"><div><span class="section-label">EXPIRY WATCH</span><h2>Expiry &amp; stock alerts</h2></div><span class="count-chip">${data.expiring.length} batches</span></div><div class="alert-list">${alerts}</div></article>
@@ -697,7 +735,7 @@ function renderWaterOverview(data) {
     if (recipient.dailyAllowed) status = { label: record?.date === data.today ? "Issued today" : "Daily eligible", className: "water-daily" };
     else if (!record || recipient.eligible) status = { label: "Available", className: "water-available" };
     else status = { label: `${recipient.remainingDays}d cooldown`, className: "water-cooldown" };
-    const exempt = WATER_EXEMPT.has(recipient.recipient);
+    const exempt = (data.rules?.exemptRooms || []).includes(recipient.recipient);
     return `<div class="water-status-card ${status.className}"><div><i>${recipient.category === "room" ? "⌂" : "✦"}</i><span>${status.label}</span></div><strong>${esc(recipient.recipient)}</strong><small>${record ? `Last issue ${prettyDate(record.date)}` : "No issue recorded"}</small>${exempt ? `<em>EXEMPT</em>` : ""}</div>`;
   };
   const rooms = recipients.filter(recipient => recipient.category === "room");
@@ -711,7 +749,7 @@ function renderWaterOverview(data) {
 function waterRecipientOption(recipient) {
   const last = recipient.lastRecord;
   const stateLabel = recipient.dailyAllowed ? "Daily eligible" : recipient.eligible ? "Available" : `${recipient.remainingDays}d cooldown`;
-  const exempt = WATER_EXEMPT.has(recipient.recipient);
+  const exempt = (state.water?.rules?.exemptRooms || []).includes(recipient.recipient);
   return `<label class="water-option ${recipient.eligible ? "" : "locked"}" data-water-option data-name="${esc(recipient.recipient.toLowerCase())}"><input type="checkbox" name="waterRecipients" value="${esc(recipient.recipient)}" ${recipient.eligible ? "" : "disabled"}><span class="checkmark"></span><strong>${esc(recipient.recipient)}</strong>${exempt ? "<em>EXEMPT</em>" : ""}<small>${last && last.date === state.water.today && !recipient.dailyAllowed ? "Issued today" : stateLabel}</small></label>`;
 }
 
@@ -766,9 +804,7 @@ function reportControls(report = "stock") {
     entries: "Entry Reports",
     movements: "All Movements Report",
   };
-  const periodButtons = isStock
-    ? `<div class="report-selector report-period-selector"><button type="button" class="${period === "daily" ? "active" : ""}" data-report-type="daily">Daily</button><button type="button" class="${period === "range" ? "active" : ""}" data-report-type="range">Date range</button></div>`
-    : `<div class="report-selector report-period-selector"><button type="button" class="${period === "daily" ? "active" : ""}" data-report-type="daily">Daily</button><button type="button" class="${period === "range" ? "active" : ""}" data-report-type="range">Date range</button><button type="button" class="${period === "monthly" ? "active" : ""}" data-report-type="monthly">Monthly</button></div>`;
+  const periodButtons = `<div class="report-selector report-period-selector"><button type="button" class="${period === "daily" ? "active" : ""}" data-report-type="daily">Daily</button><button type="button" class="${period === "range" ? "active" : ""}" data-report-type="range">Date range</button><button type="button" class="${period === "monthly" ? "active" : ""}" data-report-type="monthly">Monthly</button></div>`;
   return `<form id="report-form" class="report-form" data-report="${report}">
     ${isStock ? `<div class="report-selector report-kind-selector">${Object.entries(reportNames).map(([kind, label]) => `<button type="button" class="${kind === reportKind ? "active" : ""}" data-report-kind="${kind}">${label}</button>`).join("")}</div>` : ""}
     ${periodButtons}
@@ -776,7 +812,7 @@ function reportControls(report = "stock") {
       <label class="form-field report-date" data-report-period="daily" ${period !== "daily" || reportKind === "updates" ? "hidden" : ""}><span>REPORT DATE</span><input name="date" type="date" value="${today}"></label>
       <label class="form-field report-date" data-report-period="range" ${period !== "range" || reportKind === "updates" ? "hidden" : ""}><span>FROM</span><input name="from" type="date" value="${month}-01"></label>
       <label class="form-field report-date" data-report-period="range" ${period !== "range" || reportKind === "updates" ? "hidden" : ""}><span>TO</span><input name="to" type="date" value="${today}"></label>
-      ${!isStock ? `<label class="form-field report-date" data-report-period="monthly" ${period !== "monthly" ? "hidden" : ""}><span>MONTH</span><input name="month" type="month" value="${month}"></label>` : ""}
+      <label class="form-field report-date" data-report-period="monthly" ${period !== "monthly" || reportKind === "updates" ? "hidden" : ""}><span>MONTH</span><input name="month" type="month" value="${month}"></label>
       ${isStock ? `<label class="form-field store-param" data-report-kind-param="updates" ${reportKind !== "updates" ? "hidden" : ""}><span>STORE</span><select name="updatesStore">${state.bootstrap.stores.map(store => `<option value="${esc(store)}" ${state.reportSpec?.store === store ? "selected" : ""}>${esc(store)}</option>`).join("")}</select></label>` : ""}
       ${isStock ? `<label class="form-field store-param" data-report-kind-param="requisition" ${reportKind !== "requisition" ? "hidden" : ""}><span>REQUISITION STORE</span><select name="requisitionStore"><option value="" ${!state.reportSpec?.store ? "selected" : ""}>All Stock Requisition</option>${state.bootstrap.stores.map(store => `<option value="${esc(store)}" ${state.reportSpec?.store === store ? "selected" : ""}>${esc(store)} Requisition</option>`).join("")}</select></label>` : ""}
       <button class="button primary generate-report-button" type="submit">${reportKind === "updates" ? "Generate stock updates →" : `Generate ${isStock ? reportNames[reportKind].replace(" Report", "").replace(" Reports", "") : "report"} →`}</button>
@@ -786,8 +822,8 @@ function reportControls(report = "stock") {
 
 function reportTable(report) {
   if (!report || !report.rows?.length) return `<div class="report-empty"><span>▤</span><strong>${report ? "No records for this period" : "Your report will appear here"}</strong><p>${report ? report.reportKind === "updates" ? "Select another store or add inventory to this store." : "Choose another date or date range." : "Choose the reporting period, then generate a report."}</p></div>`;
-  const rows = report.rows.slice(0, 250).map(row => `<tr>${report.headers.map(header => `<td>${esc(row[header])}</td>`).join("")}</tr>`).join("");
-  return `<div class="report-meta"><span>${report.rows.length} ${report.rows.length === 1 ? "row" : "rows"}${report.rows.length > 250 ? " · showing first 250" : ""}</span><span>${esc(report.title)}</span></div><div class="table-scroll"><table class="data-table report-table"><thead><tr>${report.headers.map(header => `<th>${esc(header)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  const rows = report.rows.map(row => `<tr>${report.headers.map(header => `<td>${esc(row[header])}</td>`).join("")}</tr>`).join("");
+  return `<div class="report-meta"><span>${report.rows.length} ${report.rows.length === 1 ? "row" : "rows"}</span><span>${esc(report.title)}</span></div><div class="table-scroll"><table class="data-table report-table"><thead><tr>${report.headers.map(header => `<th>${esc(header)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function renderReports(options = {}) {
@@ -872,7 +908,7 @@ function renderAppearanceSettings(settings) {
 function renderAdmin(data = state.admin) {
   if (!data) return `<div class="loading-content"><span class="spinner"></span> Loading admin settings…</div>`;
   state.admin = data;
-  const tabs = ["Users", "Requesters", "Departments", "Housekeeping Areas", "Categories", "Locations", "Inventory columns", "Appearance", "Email", "Audit log", "Clear All"].map(section => `<button class="${state.adminSection === section ? "active" : ""}" data-admin-section="${section}">${section}</button>`).join("");
+  const tabs = ["Users", "Requesters", "Departments", "Housekeeping Areas", "Categories", "Locations", "Inventory columns", "Water rules", "Appearance", "Email", "Audit log", "Clear All"].map(section => `<button class="${state.adminSection === section ? "active" : ""}" data-admin-section="${section}">${section}</button>`).join("");
   let content = "";
   if (state.adminSection === "Users") {
     const users = data.users.map(user => `<tr><td><input class="inline-edit" data-user-name="${user.id}" value="${esc(user.displayName)}" aria-label="Display name for ${esc(user.username)}"><small class="cell-sub">@${esc(user.username)}</small></td><td><select class="user-role" data-user-role="${user.id}" ${user.id === state.bootstrap.user.id ? "disabled" : ""}><option value="user" ${user.role === "user" ? "selected" : ""}>Standard user</option><option value="auditor" ${user.role === "auditor" ? "selected" : ""}>Auditor</option><option value="admin" ${user.role === "admin" ? "selected" : ""}>Administrator</option></select></td><td><select class="user-active" data-user-active="${user.id}" ${user.id === state.bootstrap.user.id ? "disabled" : ""}><option value="true" ${user.active ? "selected" : ""}>Enabled</option><option value="false" ${!user.active ? "selected" : ""}>Disabled</option></select>${user.passwordResetRequired ? `<small class="cell-sub">Password change required</small>` : ""}</td><td>${prettyDate(user.createdAt)}</td><td><div class="admin-row-actions"><button class="button small secondary" data-action="save-user" data-id="${user.id}">Save</button><button class="link-button" data-action="reset-user-password" data-id="${user.id}">${state.bootstrap.passwordPolicy === "strong" ? "Reset password" : "Reset PIN"}</button>${user.id !== state.bootstrap.user.id ? `<button class="button small danger" data-action="delete-user" data-id="${user.id}">Delete</button>` : ""}</div></td></tr>`).join("");
@@ -893,6 +929,12 @@ function renderAdmin(data = state.admin) {
   } else if (state.adminSection === "Inventory columns") {
     const rows = data.inventoryColumns.map(column => `<tr><td><input class="inline-edit" data-inventory-column-name="${esc(column.id)}" value="${esc(column.name)}" aria-label="Inventory column name"></td><td><select class="user-active" data-inventory-column-active="${esc(column.id)}"><option value="true" ${column.active ? "selected" : ""}>Enabled</option><option value="false" ${!column.active ? "selected" : ""}>Disabled</option></select></td><td><div class="admin-row-actions"><button class="button small secondary" data-action="save-inventory-column" data-id="${esc(column.id)}">Save</button><button class="button small danger" data-action="delete-inventory-column" data-id="${esc(column.id)}">Delete</button></div></td></tr>`).join("");
     content = `<div class="admin-grid"><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">CUSTOM INVENTORY FIELDS</span><h2>Inventory columns</h2><p>Rename, enable or delete custom fields. Required stock columns stay fixed so inventory calculations remain intact.</p></div><span class="count-chip">${data.inventoryColumns.length} columns</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>COLUMN NAME</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>${rows || `<tr><td colspan="3"><div class="empty-state"><span>▦</span><strong>No custom columns</strong><p>Add a column to collect extra details for each stock item.</p></div></td></tr>`}</tbody></table></div></section><section class="card admin-card"><div class="panel-heading"><div><span class="section-label">EXPAND INVENTORY</span><h2>Add column</h2><p>Custom values appear in store inventory and stock updates reports.</p></div></div><form id="inventory-column-form" class="stack-form">${field("COLUMN NAME *", "name", "text", { required: true, minlength: 2, maxlength: 60, placeholder: "e.g. Storage shelf" })}<button class="button primary" type="submit">Add column</button></form></section></div>`;
+  } else if (state.adminSection === "Water rules") {
+    const rules = data.settings.waterRules;
+    const roomOptions = (listName, selectedRooms) => state.bootstrap.waterRooms.map(room =>
+      `<label class="water-rule-option"><input type="checkbox" name="${listName}" value="${esc(room)}" ${selectedRooms.includes(room) ? "checked" : ""}><span>${esc(room)}</span></label>`,
+    ).join("");
+    content = `<section class="card admin-card water-rules-card"><div class="panel-heading"><div><span class="section-label">WATER ELIGIBILITY</span><h2>Room cooldown and exemptions</h2><p>Choose rooms that must wait three days and rooms that may receive water daily. Exemptions take priority if a room is selected in both lists.</p></div><span class="count-chip">Saved for all users</span></div><form id="water-rules-form" class="water-rules-form"><fieldset><legend>Three-day cooldown rooms</legend><div class="water-rule-grid">${roomOptions("cooldownRooms", rules.cooldownRooms)}</div></fieldset><fieldset><legend>Exempt rooms</legend><div class="water-rule-grid">${roomOptions("exemptRooms", rules.exemptRooms)}</div></fieldset><div class="modal-actions"><button type="submit" class="button primary">Save water rules</button></div></form></section>`;
   } else if (state.adminSection === "Email") {
     content = `<section class="card admin-card email-config"><div class="panel-heading"><div><span class="section-label">GMAIL DELIVERY</span><h2>Report email settings</h2><p>Generate reports locally, then send them as CSV attachments through Gmail.</p></div><span class="mail-icon">✉</span></div><form id="mail-config-form" class="email-config-form"><div class="form-grid two-col">${field("GMAIL SENDER ADDRESS *", "gmailAddress", "email", { required: true, value: data.settings.gmailAddress, placeholder: "reports@gmail.com" })}${field("GOOGLE APP PASSWORD *", "appPassword", "password", { required: true, maxlength: 32, autocomplete: "new-password", placeholder: "16-character App Password" })}</div><div class="email-safety"><strong>⚿ Password is memory-only</strong><p>The app password is never written to the database. It is cleared when the local server exits; enter it again after restarting. Use a Google App Password, not your main Google password.</p></div><button class="button primary" type="submit">Save Gmail sender</button><span class="configured-badge ${data.settings.appPasswordConfigured ? "ready" : ""}">${data.settings.appPasswordConfigured ? "Ready for this session" : "Not configured this session"}</span></form></section>`;
   } else if (state.adminSection === "Appearance") {
@@ -925,6 +967,7 @@ async function navigate(page) {
   try {
     if (page === "Dashboard") {
       const dashboard = await api("/api/dashboard");
+      if (state.startupLoading) await completeStartupProgress();
       state.startupLoading = false;
       render(renderDashboard(dashboard));
     } else if (page === "Inventory") {
@@ -989,6 +1032,7 @@ async function refreshCurrentPage() {
   const inventorySection = state.inventorySection;
   const refreshed = await api("/api/bootstrap");
   state.bootstrap = { ...state.bootstrap, ...refreshed };
+  detectDesktopUpdate(state.bootstrap);
   state.appearanceDraft = null;
   applyAppearance();
   if (!state.bootstrap.user) {
@@ -1020,31 +1064,70 @@ function showLogin() {
 
 async function initialize() {
   state.startupLoading = true;
-  app.innerHTML = startupSplashMarkup();
+  startStartupProgress();
   startConnectionMonitor();
   try {
     state.bootstrap = await api("/api/bootstrap");
+    detectDesktopUpdate(state.bootstrap);
     state.appearanceDraft = null;
     applyAppearance();
     if (state.bootstrap.setupRequired) {
+      await completeStartupProgress();
       state.startupLoading = false;
       showSetup();
     } else if (!state.bootstrap.user) {
+      await completeStartupProgress();
       state.startupLoading = false;
       showLogin();
     }
     else await navigate("Dashboard");
   } catch (error) {
+    stopStartupProgress();
     state.startupLoading = false;
     app.innerHTML = `<section class="fatal-screen"><span>!</span><h1>App server unavailable</h1><p>${esc(error.message)}</p><button class="button primary" data-action="initialize">Retry connection</button></section>`;
   }
 }
 
+function updateStartupProgress(progress, status) {
+  state.startupProgress = Math.max(state.startupProgress, Math.min(100, Math.round(progress)));
+  const bar = document.querySelector("#startup-progress-fill");
+  const percentage = document.querySelector("#startup-progress-value");
+  const message = document.querySelector("#startup-progress-status");
+  if (bar) bar.style.width = `${state.startupProgress}%`;
+  if (percentage) percentage.textContent = `${state.startupProgress}%`;
+  if (bar) bar.setAttribute("aria-valuenow", String(state.startupProgress));
+  if (status && message) message.textContent = status;
+}
+
+function stopStartupProgress() {
+  if (!state.startupProgressTimer) return;
+  window.clearInterval(state.startupProgressTimer);
+  state.startupProgressTimer = null;
+}
+
+function startStartupProgress() {
+  stopStartupProgress();
+  state.startupProgress = 0;
+  app.innerHTML = startupSplashMarkup();
+  updateStartupProgress(0, "Connecting securely to your workspace…");
+  state.startupProgressTimer = window.setInterval(() => {
+    if (state.startupProgress < 90) {
+      const step = state.startupProgress < 30 ? 6 : state.startupProgress < 65 ? 3 : 1;
+      updateStartupProgress(state.startupProgress + step);
+    }
+  }, 450);
+}
+
+async function completeStartupProgress() {
+  updateStartupProgress(100, "Your live workspace is ready.");
+  stopStartupProgress();
+  await new Promise(resolve => window.setTimeout(resolve, 300));
+}
+
 function startupSplashMarkup() {
   const hostname = window.location.hostname.toLocaleLowerCase();
   const localWorkspace = ["localhost", "127.0.0.1", "::1"].includes(hostname);
-  const serviceName = hostname.endsWith(".onrender.com") ? "Render" : "your online workspace";
-  return `<div class="boot-screen" aria-live="polite"><div class="boot-card"><img class="boot-logo" src="/assets/capitol-catering-icon.png" alt=""><span class="boot-brand">CAPITOL STOCK MANAGEMENT</span><span class="spinner" aria-hidden="true"></span><strong class="boot-status">${localWorkspace ? "Opening your local workspace…" : `Connecting to ${serviceName}…`}</strong><p class="boot-detail">${localWorkspace ? "Loading your local inventory and account details." : "Fetching live inventory and account details from the hosted server."}</p></div></div>`;
+  return `<div class="boot-screen" aria-live="polite"><div class="boot-card"><img class="boot-logo" src="/assets/capitol-catering-icon.png" alt="Capitol Stock Management"><span class="boot-brand">CAPITOL STOCK MANAGEMENT</span><strong class="boot-status" id="startup-progress-status">${localWorkspace ? "Opening your workspace…" : "Connecting securely to your workspace…"}</strong><div class="startup-progress-track" role="progressbar" aria-label="Loading live Capitol workspace" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="startup-progress-fill"></span></div><strong class="startup-progress-value" id="startup-progress-value">0%</strong><p class="boot-detail">${localWorkspace ? "Loading your local workspace." : "Loading the latest live workspace and inventory."}</p></div></div>`;
 }
 
 function formValues(form) {
@@ -1254,6 +1337,11 @@ document.addEventListener("click", async event => {
   if (target.dataset.requestArchiveStore) {
     state.openRequestArchiveStore = state.openRequestArchiveStore === target.dataset.requestArchiveStore ? "" : target.dataset.requestArchiveStore;
     render(renderRequests(state.requests));
+    return;
+  }
+  if (target.dataset.action === "toggle-stock-alerts") {
+    state.stockAlertOpen = !state.stockAlertOpen;
+    render(renderDashboard(state.dashboard));
     return;
   }
   if (["new-item", "edit-item", "receipt-item"].includes(target.dataset.action)) {
@@ -1899,7 +1987,7 @@ document.addEventListener("submit", async event => {
   } else if (form.id === "water-issue-form") {
     const recipients = [...form.querySelectorAll('input[name="waterRecipients"]:checked')].map(input => input.value);
     if (!recipients.length) return toast("Select at least one room or staff unit.", true);
-    const exempt = recipients.filter(name => WATER_EXEMPT.has(name));
+    const exempt = recipients.filter(name => (state.water?.rules?.exemptRooms || []).includes(name));
     if (exempt.length && !window.confirm(`${exempt.join(", ")} ${exempt.length === 1 ? "is" : "are"} exempt from cooldown. Confirm daily issuance?`)) return;
     const submit = form.querySelector('[data-action="submit-water"]');
     setLoading(submit, true, "Recording water issue…");
@@ -2017,6 +2105,19 @@ document.addEventListener("submit", async event => {
       const result = await api("/api/admin/mail", { method: "POST", body: formValues(form) });
       state.bootstrap.gmailConfigured = result.configured;
       toast("Gmail sender is ready for this session.");
+      await reloadAdmin();
+    } catch (error) { toast(error.message, true); }
+    finally { if (submit.isConnected) setLoading(submit, false); }
+  } else if (form.id === "water-rules-form") {
+    const submit = form.querySelector('[type="submit"]');
+    const body = {
+      cooldownRooms: [...form.querySelectorAll('[name="cooldownRooms"]:checked')].map(input => input.value),
+      exemptRooms: [...form.querySelectorAll('[name="exemptRooms"]:checked')].map(input => input.value),
+    };
+    setLoading(submit, true, "Saving water rules…");
+    try {
+      await api("/api/admin/water-rules", { method: "PUT", body });
+      toast("Water cooldown and exemption rules saved.");
       await reloadAdmin();
     } catch (error) { toast(error.message, true); }
     finally { if (submit.isConnected) setLoading(submit, false); }

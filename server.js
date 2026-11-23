@@ -16,6 +16,7 @@ if (process.env.NODE_ENV === "production" && !usePostgres) {
 const HOST = usePostgres ? "0.0.0.0" : "127.0.0.1";
 const SESSION_COOKIE = "capitol_session";
 const SESSION_MS = 8 * 60 * 60 * 1000;
+const APP_VERSION = require("./package.json").version;
 const DEFAULT_CATEGORIES = ["Dry", "Chemical", "Protein", "Fruit", "Vegetable", "Other"];
 const DEFAULT_STORES = ["Dry Store", "Chemical Store", "Protein Store", "Fruit Store", "Vegetable Store", "Frozen Store"];
 const APPEARANCE_FONTS = {
@@ -657,6 +658,52 @@ function getWaterRequesters() {
 function getSettings() {
   const rows = db.prepare("SELECT key, value FROM settings").all();
   return Object.fromEntries(rows.map(row => [row.key, row.value]));
+}
+
+function getWaterRules(settings = getSettings()) {
+  const defaultExemptRooms = [...WATER_EXEMPT];
+  const defaultCooldownRooms = WATER_ROOMS.filter(room => !WATER_EXEMPT.has(room));
+  const readRooms = (key, fallback) => {
+    if (settings[key] === undefined) return fallback;
+    let rooms;
+    try {
+      rooms = JSON.parse(settings[key]);
+    } catch (error) {
+      throw new Error(`Saved water rule ${key} is invalid JSON: ${error.message}`);
+    }
+    if (!Array.isArray(rooms) || rooms.some(room => typeof room !== "string" || !WATER_ROOMS.includes(room))) {
+      throw new Error(`Saved water rule ${key} contains an invalid room list.`);
+    }
+    return [...new Set(rooms)];
+  };
+  return {
+    cooldownDays: 3,
+    cooldownRooms: readRooms("waterCooldownRooms", defaultCooldownRooms),
+    exemptRooms: readRooms("waterExemptRooms", defaultExemptRooms),
+  };
+}
+
+function updateWaterRules(body, actor) {
+  const normalizeRooms = (value, label) => {
+    if (!Array.isArray(value) || value.length > WATER_ROOMS.length ||
+        value.some(room => typeof room !== "string" || !WATER_ROOMS.includes(room))) {
+      throw httpError(400, `Choose valid rooms for ${label}.`);
+    }
+    return [...new Set(value)];
+  };
+  const cooldownRooms = normalizeRooms(body.cooldownRooms, "the three-day cooldown");
+  const exemptRooms = normalizeRooms(body.exemptRooms, "the exemption list");
+  transaction(() => {
+    const save = db.prepare(`
+      INSERT INTO settings (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    save.run("waterCooldownRooms", JSON.stringify(cooldownRooms));
+    save.run("waterExemptRooms", JSON.stringify(exemptRooms));
+    addAudit(actor, "settings.water_rules",
+      `Saved water rules: ${cooldownRooms.length} rooms on cooldown, ${exemptRooms.length} exempt rooms.`);
+  });
+  return { waterRules: getWaterRules() };
 }
 
 function getAppearanceSettings(settings = getSettings()) {
@@ -1820,11 +1867,16 @@ function latestWaterRecords() {
 function waterSnapshot() {
   const latest = new Map(latestWaterRecords().map(record => [record.recipient, record]));
   const today = todayKey();
+  const rules = getWaterRules();
+  const cooldownRooms = new Set(rules.cooldownRooms);
+  const exemptRooms = new Set(rules.exemptRooms);
   const recipients = WATER_RECIPIENTS.map(recipient => {
     const lastRecord = latest.get(recipient) || null;
-    const dailyAllowed = WATER_STAFF.includes(recipient) || WATER_EXEMPT.has(recipient);
+    const dailyAllowed = WATER_STAFF.includes(recipient) ||
+      exemptRooms.has(recipient) ||
+      (recipient.startsWith("Room ") && !cooldownRooms.has(recipient));
     const elapsed = lastRecord ? Math.max(0, dateDiff(lastRecord.date, today)) : null;
-    const remainingDays = lastRecord && !dailyAllowed ? Math.max(0, 3 - elapsed) : 0;
+    const remainingDays = lastRecord && !dailyAllowed ? Math.max(0, rules.cooldownDays - elapsed) : 0;
     return {
       recipient,
       category: WATER_STAFF.includes(recipient) ? "staff" : "room",
@@ -1836,7 +1888,7 @@ function waterSnapshot() {
   });
   return {
     today,
-    cooldownDays: 3,
+    rules,
     recipients,
     records: db.prepare("SELECT * FROM water_records ORDER BY date DESC, created_at DESC").all(),
   };
@@ -1855,15 +1907,20 @@ function issueWater(body, actor) {
   if (!issuedBy || issuedBy.length > 120) throw httpError(400, "Enter the issuer's name.");
 
   const previous = new Map(latestWaterRecords().map(record => [record.recipient, record]));
+  const rules = getWaterRules();
+  const cooldownRooms = new Set(rules.cooldownRooms);
+  const exemptRooms = new Set(rules.exemptRooms);
   const today = todayKey();
   const issued = [];
   const skipped = [];
   for (const recipient of body.recipients) {
     const last = previous.get(recipient);
-    const dailyAllowed = WATER_STAFF.includes(recipient) || WATER_EXEMPT.has(recipient);
+    const dailyAllowed = WATER_STAFF.includes(recipient) ||
+      exemptRooms.has(recipient) ||
+      (recipient.startsWith("Room ") && !cooldownRooms.has(recipient));
     const elapsed = last ? dateDiff(last.date, today) : Number.POSITIVE_INFINITY;
-    if (!dailyAllowed && last && elapsed < 3) {
-      skipped.push({ recipient, remainingDays: Math.max(1, 3 - Math.max(0, elapsed)) });
+    if (!dailyAllowed && last && elapsed < rules.cooldownDays) {
+      skipped.push({ recipient, remainingDays: Math.max(1, rules.cooldownDays - Math.max(0, elapsed)) });
       continue;
     }
     issued.push({ id: crypto.randomUUID(), date: today, recipient, quantity, requestedBy: body.requestedBy, issuedBy, actor });
@@ -1896,9 +1953,11 @@ function updateWaterRecord(id, body, actor) {
   if (!Number.isSafeInteger(quantity) || quantity <= 0 || quantity > 1_000_000) throw httpError(400, "Water quantity must be a positive whole number of packs.");
   if (!getWaterRequesters().includes(requestedBy)) throw httpError(400, "Choose an active water requester.");
   if (!issuedBy || issuedBy.length > 120) throw httpError(400, "Enter the issuer's name.");
+  const rules = getWaterRules();
+  const requiresCooldown = rules.cooldownRooms.includes(recipient) && !rules.exemptRooms.includes(recipient);
   const nearby = db.prepare("SELECT date FROM water_records WHERE recipient = ? AND id <> ? ORDER BY date").all(recipient, id);
-  if (!WATER_STAFF.includes(recipient) && !WATER_EXEMPT.has(recipient) &&
-      nearby.some(other => Math.abs(dateDiff(other.date, date)) < 3)) {
+  if (!WATER_STAFF.includes(recipient) && requiresCooldown &&
+      nearby.some(other => Math.abs(dateDiff(other.date, date)) < rules.cooldownDays)) {
     throw httpError(409, "This edit conflicts with the room's three-day cooldown.");
   }
   db.prepare(`
@@ -2147,7 +2206,7 @@ function stockReport(body) {
   const store = reportKind === "requisition" && body.store ? String(body.store) : "";
   if (store && !getLocations().some(location => location.name === store)) throw httpError(400, "Select a valid store for the requisition report.");
   const rows = db.prepare(`
-    SELECT t.request_date AS date, t.item_name AS item, t.item_sku AS sku, i.category,
+    SELECT t.request_date AS date, t.item_id AS itemId, t.item_name AS item, t.item_sku AS sku, i.category,
       COALESCE(t.request_group_id, t.id) AS requestId,
       COALESCE(l.name, t.location_name) AS location,
       t.quantity, t.unit, t.kind, t.department, t.person, t.area, t.issued_by AS issuedBy, t.supplier,
@@ -2171,9 +2230,14 @@ function stockReport(body) {
     : rows;
   const reportRows = reportKind === "requisition"
     ? [...filtered.reduce((grouped, row) => {
-      const current = grouped.get(row.requestId);
+      const requestLineKey = [
+        row.requestId,
+        row.itemId || row.sku,
+        row.location,
+      ].join("\u0000");
+      const current = grouped.get(requestLineKey);
       if (current) current.quantity += row.quantity;
-      else grouped.set(row.requestId, { ...row });
+      else grouped.set(requestLineKey, { ...row });
       return grouped;
     }, new Map()).values()]
     : filtered;
@@ -2249,7 +2313,10 @@ function waterReport(body) {
     throw httpError(400, "Choose a valid water report type.");
   }
   const records = db.prepare(`
-    SELECT date AS date, recipient AS recipient, quantity, requested_by AS requestedBy, issued_by AS issuedBy, created_by AS createdBy
+    SELECT date AS date, recipient AS recipient, quantity,
+      COALESCE(NULLIF(TRIM(requested_by), ''), NULLIF(TRIM(created_by), ''), 'Unknown') AS requestedBy,
+      COALESCE(NULLIF(TRIM(issued_by), ''), NULLIF(TRIM(created_by), ''), 'Unknown') AS issuedBy,
+      created_by AS createdBy
     FROM water_records WHERE date >= ? AND date <= ? ORDER BY date, recipient COLLATE NOCASE, created_at
   `).all(from, to);
   if (type === "daily") {
@@ -2447,6 +2514,7 @@ function adminOverview() {
       gmailAddress: settings.gmailAddress || "",
       appPasswordConfigured: Boolean(gmailAppPassword && mailerAddress),
       appearance: getAppearanceSettings(settings),
+      waterRules: getWaterRules(settings),
     },
     audit: db.prepare("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 100").all(),
   };
@@ -2522,6 +2590,7 @@ function publicBootstrap(request) {
   const adminCount = db.prepare("SELECT COUNT(*) AS count FROM users").get().count;
   const session = currentSession(request);
   const base = {
+    appVersion: APP_VERSION,
     setupRequired: adminCount === 0,
     passwordPolicy: usePostgres ? "strong" : "pin",
     categories: getCategories().map(category => category.name),
@@ -2679,6 +2748,9 @@ route("GET", "/api/dashboard", request => {
     totalUnits: items.reduce((sum, item) => sum + item.on_hand, 0),
     lowStock: items.filter(item => item.stock_status === "Low stock").length,
     outOfStock: items.filter(item => item.stock_status === "Out of stock").length,
+    stockAlertItems: items
+      .filter(item => item.stock_status === "Low stock" || item.stock_status === "Out of stock")
+      .map(item => ({ sku: item.sku, store: item.store, item: item.name, remainder: item.remainder })),
     stockIssuedToday: db.prepare("SELECT COUNT(*) AS count FROM stock_transactions WHERE quantity < 0 AND voided_at IS NULL AND substr(request_date, 1, 10) = ?").get(todayKey()).count,
     waterIssuedToday: db.prepare("SELECT COUNT(*) AS count FROM water_records WHERE date = ?").get(todayKey()).count,
     expiring: getInventorySummary().expiring,
@@ -2851,6 +2923,11 @@ route("POST", "/api/reports/email", async (request, _response, body) => {
 route("GET", "/api/admin", request => {
   requireAdmin(request);
   return adminOverview();
+});
+route("PUT", "/api/admin/water-rules", (request, _response, body) => {
+  const admin = requireAdmin(request, true);
+  const actor = db.prepare("SELECT * FROM users WHERE id = ?").get(admin.userId);
+  return updateWaterRules(body, actor);
 });
 route("POST", "/api/admin/departments", (request, _response, body) => {
   const admin = requireAdmin(request, true);

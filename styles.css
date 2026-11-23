@@ -74,8 +74,10 @@ a { color: inherit; text-decoration: none; }
 .boot-card { display: grid; justify-items: center; gap: 17px; width: min(440px, 100%); text-align: center; }
 .boot-logo { width: 68px; height: 68px; object-fit: contain; border-radius: 18px; box-shadow: 0 12px 34px rgba(0, 0, 0, .28); }
 .boot-brand { color: #dce8f1; font-size: .73rem; font-weight: 800; letter-spacing: .18em; }
-.boot-screen .spinner { width: 32px; height: 32px; margin-top: 12px; border-width: 3px; border-color: rgba(224, 238, 248, .2); border-top-color: #45cfb4; }
 .boot-status { color: #fff; font-size: clamp(1.05rem, 3.5vw, 1.28rem); font-weight: 800; }
+.startup-progress-track { width: min(390px, 100%); height: 22px; overflow: hidden; border: 1px solid rgba(220, 237, 247, .32); border-radius: 6px; background: rgba(226, 238, 246, .12); box-shadow: inset 0 2px 6px rgba(0, 0, 0, .28); }
+.startup-progress-track > span { display: block; width: 0; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #27a990, #74e6c6); box-shadow: 0 0 18px rgba(67, 220, 180, .42); transition: width .32s ease; }
+.startup-progress-value { color: #fff; font-size: clamp(1.8rem, 8vw, 2.8rem); font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -.04em; }
 .boot-detail { max-width: 340px; margin: -7px 0 0; color: #bfced9; font-size: .92rem; line-height: 1.55; }
 .spinner {
   width: 23px; height: 23px; border: 3px solid #dfe9e8; border-top-color: var(--teal);
@@ -780,6 +782,33 @@ a { color: inherit; text-decoration: none; }
 #app .appearance-preview-copy { max-width: 560px; margin: 7px 0; color: var(--heading); font-family: var(--app-font-family); font-size: calc(calc(16px * var(--font-scale, 1)) * var(--font-scale)); font-weight: var(--app-font-weight); line-height: 1.55; }
 #app #pretext-layout-result { color: var(--muted); }
 #app .refresh-button { color: var(--ink); background: var(--paper); }
+#app .clickable-stat { width: 100%; color: var(--ink); font: inherit; text-align: left; cursor: pointer; transition: transform .16s ease, box-shadow .16s ease; }
+#app .clickable-stat:hover { transform: translateY(-2px); box-shadow: 0 12px 28px rgba(21, 41, 58, .12); }
+#app .clickable-stat:focus-visible { outline: 3px solid var(--teal); outline-offset: 3px; }
+#app .stock-alert-list { margin: -6px 0 20px; padding: 18px; }
+#app .desktop-update-notice { display: flex; align-items: center; gap: 12px; margin: 12px 24px 0; padding: 12px 15px; border: 1px solid #90cbbd; border-radius: 10px; color: var(--ink); background: color-mix(in srgb, var(--teal) 12%, var(--paper)); }
+#app .desktop-update-notice > span { font-size: 20px; font-weight: 800; }
+#app .desktop-update-notice > div { display: grid; flex: 1; gap: 3px; }
+#app .desktop-update-notice small { color: var(--muted); }
+#app .water-rules-card { padding: 19px; }
+#app .water-rules-form { display: grid; gap: 15px; }
+#app .water-rules-form fieldset { min-width: 0; margin: 0; padding: 14px; border: 1px solid var(--line); border-radius: 10px; }
+#app .water-rules-form legend { float: none; width: auto; margin: 0; padding: 0 6px; color: var(--heading); font-size: calc(12px * var(--font-scale, 1)); font-weight: 800; }
+#app .water-rule-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 6px; }
+#app .water-rule-option { display: flex; min-height: 36px; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); cursor: pointer; }
+#app .water-rule-option input { width: 16px; height: 16px; margin: 0; accent-color: var(--teal); }
+#app[data-theme="dark"] .page-content .card,
+#app[data-theme="dark"] .page-content .store-section,
+#app[data-theme="dark"] .page-content .water-status-card,
+#app[data-theme="dark"] .page-content .water-option,
+#app[data-theme="dark"] .page-content .appearance-theme-card {
+  color: var(--dark-text, #fff) !important;
+  border-color: var(--dark-border, #334155) !important;
+  background: var(--dark-surface, #141e2e) !important;
+}
+#app[data-theme="dark"] .page-content :not(.pill):not(.positive):not(.negative) { color: var(--dark-text, #fff) !important; }
+#app[data-theme="dark"] .page-content :is(input, select, textarea) { color: var(--dark-text, #fff) !important; border-color: var(--dark-border, #334155) !important; background-color: var(--dark-surface, #141e2e) !important; }
+#app[data-theme="dark"] .page-content :is(.stat-top i, .water-status-card em, .water-option em) { color: var(--dark-text, #fff) !important; background: #273448 !important; }
 #app[data-font-weight="400"] { --app-font-weight: 400; }
 #app[data-font-weight="500"] { --app-font-weight: 500; }
 #app[data-font-weight="600"] { --app-font-weight: 600; }
@@ -809,6 +838,9 @@ a { color: inherit; text-decoration: none; }
   #app .appearance-live-preview { align-items: stretch; flex-direction: column; }
   #app .appearance-scale-labels { font-size: calc(9px * var(--font-scale, 1)); }
   #app .appearance-color-grid { gap: 7px; }
+  #app .desktop-update-notice { flex-wrap: wrap; margin-right: 12px; margin-left: 12px; }
+  #app .desktop-update-notice .button { margin-left: auto; }
+  #app .water-rule-grid { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); }
 }
 
 @media print {

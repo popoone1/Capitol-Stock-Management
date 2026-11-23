@@ -93,6 +93,8 @@ async function startServer() {
 }
 
 function createWindow(url) {
+  const appUrl = new URL(url);
+  if (app.isPackaged) appUrl.searchParams.set("desktopVersion", app.getVersion());
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -111,7 +113,7 @@ function createWindow(url) {
   });
   mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  mainWindow.loadURL(url).catch(error => {
+  mainWindow.loadURL(appUrl.href).catch(error => {
     dialog.showErrorBox(PRODUCT_NAME, `The application window could not be opened.\n\n${error.message}`);
     app.quit();
   });
